@@ -78,7 +78,7 @@ def print_trainable_parameters(cfg):
     print(f"| Utilization:                 {active_params/total_params:.1%}")
     print("| --------------------------------------------------------------------")
 
-def estimate_flops(model, cfg):
+def estimate_flops(cfg):
     """ Prints the estimated number of FLOPs per token for the model and for the run. """
     n_layers = cfg.model.n_layers
     n_embd = cfg.model.n_embd

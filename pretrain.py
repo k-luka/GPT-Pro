@@ -54,7 +54,7 @@ def main(cfg: DictConfig):
     torch.backends.cudnn.allow_tf32 = True
 
 
-    # define model
+    # Define model
     model = GPT(
         n_embd = cfg.model.n_embd,
         vocab_size = cfg.model.vocab_size,
@@ -65,15 +65,25 @@ def main(cfg: DictConfig):
         kv_latent_size = cfg.model.kv_latent_size,
         q_latent_size = cfg.model.q_latent_size,
         n_layers = cfg.model.n_layers,
+        n_shared_experts = cfg.model.n_shared_experts,
+        n_routed_experts = cfg.model.n_routed_experts,
+        topk_experts = cfg.model.topk_experts,
+        expert_hidden_size = cfg.model.expert_hidden_size,
+        dtype = torch.bfloat16
     )
     
+    # Move to device BEFORE FSDP wrapping
+    model.to(device_obj)
+
     model = FSDP(
         model,
         auto_wrap_policy=get_auto_wrap_policy(),
         device_id=device_obj,
+        # Recommended FSDP settings for BF16 mixed precision if needed:
+        # mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, ...),
     )
 
-    # Commented out for saving debug
+    # Compile usually works best after FSDP in recent PyTorch versions
     model = torch.compile(model)
 
     # trainer
@@ -107,11 +117,8 @@ def main(cfg: DictConfig):
     )
 
     if master_rank:
-        # print trainable params
-        print_trainable_parameters(model) 
-
-        # estimate flops
-        estimate_flops(model, cfg)
+        print_trainable_parameters(cfg) 
+        estimate_flops(cfg)
 
     # check if training from checkpoint
     resume_path = cfg.get("resume_checkpoint", None)
