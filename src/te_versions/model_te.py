@@ -428,15 +428,15 @@ class GPT(nn.Module):
 
     # initialize weights
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            std = 0.01
+        std = 0.015
+        if isinstance(module, (nn.Linear, te.Linear, te.GroupedLinear)):
             if hasattr(module, "RESIDUAL_SCALE_INIT_FACTOR"):
                 std *= 1 / (math.sqrt(2 * self.n_layers))
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std) # pyrefly: ignore
             if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+                torch.nn.init.zeros_(module.bias) # pyrefly: ignore
         if isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.01)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -490,36 +490,36 @@ class GPT(nn.Module):
             idx = torch.cat([idx, idx_next], dim=-1)
         return idx
 
-    def configure_optimizers(self, weight_decay, learning_rate, device):
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
         decay_params = []
         nodecay_params = []
         seen = set()
 
         for n, p in self.named_parameters():
             if p.requires_grad:
-                if p in seen:
+                if id(p) in seen:
                     continue
-                seen.add(p)
+                seen.add(id(p))
 
-                if n.endswith(".bias") or "norm" in n or "ln" in n:
-                    nodecay_params.append(p)
-                else:
+                if p.dim() >= 2:
                     decay_params.append(p)
+                else:
+                    nodecay_params.append(p)
 
-        # Configure fused AdamW
-        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and "cuda" in str(device)
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+
+        if self.rank == 0:
+            print(f"Decayed params: {sum(p.numel() for p in decay_params):,}")
+            print(f"No-decay params: {sum(p.numel() for p in nodecay_params):,}")
+
+        use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
         if self.rank == 0:
             print(f"Using fused AdamW: {use_fused}")
 
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": decay_params, "weight_decay": weight_decay},
-                {"params": nodecay_params, "weight_decay": 0.0},
-            ], 
-            lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
-        )
-        return optimizer
+        return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), fused=use_fused)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
