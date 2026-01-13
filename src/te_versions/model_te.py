@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import inspect
 import math
-from src.helpers import apply_rotary_emb, norm
+from src.helpers import apply_rotary_emb
 import torch.distributed as dist
 import transformer_engine.pytorch as te
 import json
@@ -29,9 +29,8 @@ class MLA(nn.Module):
         self.kv_latent_size = kv_latent_size
         self.q_latent_size = q_latent_size
 
-        # [OPTIMIZATION] Fused Down-Projection
+        # Fused Down-Projection
         # Projects x into ALL latent vectors at once: (Q_latent | KV_latent | K_rope)
-        # This replaces w_down_q and w_kva to save VRAM reads
         self.w_down = te.Linear(
             n_embd, 
             q_latent_size + kv_latent_size + rope_head_size, 
@@ -105,8 +104,7 @@ class MLA(nn.Module):
 
         # 6. Attention
         # Force Flash Attention for speed
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.proj(out)
@@ -128,7 +126,9 @@ class Attention(nn.Module):
         self.proj = te.Linear(
             n_embd, n_embd, bias=False, params_dtype=dtype
         )
-        self.proj.RESIDUAL_SCALE_INIT_FACTOR = True 
+        self.q_norm = te.RMSNorm(self.H, params_dtype=dtype)
+        self.k_norm = te.RMSNorm(self.H, params_dtype=dtype)
+        self.proj.RESIDUAL_SCALE_INIT_FACTOR = True
 
     def forward(self, x, sin, cos):
         B, T, C = x.shape
@@ -139,10 +139,9 @@ class Attention(nn.Module):
         # Apply RoPE
         q = apply_rotary_emb(q, sin, cos)
         k = apply_rotary_emb(k, sin, cos)
-        q, k = norm(q), norm(k)
+        q, k = self.q_norm(q), self.k_norm(k)
         
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.proj(out)
@@ -212,7 +211,7 @@ class Gate(nn.Module):
         scores = logits.sigmoid()
 
         # Break the link between the computation and the storage buffer.
-        bias_term = self.bias.detach() 
+        bias_term = self.bias.detach() # pyrefly: ignore
 
         topk_idx = torch.topk(scores + bias_term, self.topk, dim=-1)[1].to(
             dtype=torch.int32
@@ -262,7 +261,7 @@ class MoE(nn.Module):
         # Determine correction direction
         correction = torch.sign(target_load - actual_load)
         
-        self.gate.bias.add_(update_rate * correction) 
+        self.gate.bias.add_(update_rate * correction) # pyrefly: ignore
 
     def forward(self, x):
         B, T, C = x.shape
@@ -414,7 +413,7 @@ class GPT(nn.Module):
         # Collect data
         batch_log = []
         for i, block in enumerate(self.transformer):
-            if block.moe.last_global_counts is not None:
+            if block.moe.last_global_counts is not None: # pyrefly: ignore
                 entry = {
                     "step": self.step_counter,
                     "layer": i,
@@ -445,8 +444,8 @@ class GPT(nn.Module):
             T <= self.block_size
         ), f"Sequence length ({T}) is longer than the block_size ({self.block_size})."
         x = self.wte(idx)
-        sin = self.sin[:, :, :T, :] 
-        cos = self.cos[:, :, :T, :] 
+        sin = self.sin[:, :, :T, :] # pyrefly: ignore
+        cos = self.cos[:, :, :T, :] # pyrefly: ignore
 
         for block in self.transformer:
             x = block(x, sin, cos)
@@ -479,7 +478,7 @@ class GPT(nn.Module):
 
         for _ in range(max_tokens):
             logits, _ = self.forward(idx)
-            logits = logits[:, -1, :] 
+            logits = logits[:, -1, :] # pyrefly: ignore
             probs = F.softmax(logits, dim=-1)
             topk_probs, topk_indices = torch.topk(probs, k=topk)
             idx_next = torch.multinomial(topk_probs, num_samples=1)
