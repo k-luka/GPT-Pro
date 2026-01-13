@@ -1,181 +1,145 @@
-import torch
-import torch.nn.functional as F
-import os
+import math
 import humanize
+import torch
 import torch.distributed as dist
 
-def _count_unique_params(params):
-    seen = set()
-    total = 0
-    for param in params:
-        pid = id(param)
-        if pid in seen:
-            continue
-        seen.add(pid)
-        total += param.numel()
-    return total
+def print_trainable_parameters(cfg):
+    """
+    Estimates parameters based on configuration.
+    """
+    # 1. Architecture Constants
+    n_layers = cfg.model.n_layers
+    n_embd = cfg.model.n_embd
+    vocab_size = cfg.model.vocab_size
+    n_heads = cfg.model.n_heads
+    
+    # MLA specifics
+    k_size = cfg.model.kv_latent_size
+    q_size = cfg.model.q_latent_size
+    head_size = cfg.model.head_size
+    rope_size = cfg.model.rope_head_size
+    lat_head_size = head_size - rope_size
+    
+    # 2. Embedding + Head
+    params_emb = vocab_size * n_embd
+    params_ln_f = n_embd # Final Layer Norm
 
-def _unwrap_fsdp(module):
-    return getattr(module, "_fsdp_wrapped_module", module)
-
-def _iter_moe_modules(model):
-    seen = set()
-    root = _unwrap_fsdp(model)
-    for module in root.modules():
-        candidate = _unwrap_fsdp(module)
-        mid = id(candidate)
-        if mid in seen:
-            continue
-        seen.add(mid)
-        if (
-            hasattr(candidate, "n_routed_experts")
-            and hasattr(candidate, "topk")
-            and hasattr(candidate, "routed_fused_proj")
-            and hasattr(candidate, "routed_down_proj")
-        ):
-            yield candidate
-
-def _count_routed_params(moe_module):
-    routed_params = []
-    for name, param in moe_module.named_parameters(recurse=True):
-        if "routed_fused_proj" in name or "routed_down_proj" in name:
-            routed_params.append(param)
-    return _count_unique_params(routed_params)
-
-def print_trainable_parameters(model):
-    total_params = _count_unique_params(model.parameters())
-    trainable_params = _count_unique_params(
-        p for p in model.parameters() if p.requires_grad
-    )
-    inactive_routed_params = 0.0
-    world_size = dist.get_world_size()
-    for moe in _iter_moe_modules(model):
-        try:
-            n_routed = int(moe.n_routed_experts)
-            topk = int(moe.topk)
-        except (TypeError, ValueError):
-            continue
-        if n_routed <= 0 or topk <= 0:
-            continue
-        routed_params = _count_routed_params(moe)
-        active_frac = min(topk / n_routed, 1.0)
-        inactive_routed_params += routed_params * (1.0 - active_frac)
-    active_params = total_params - inactive_routed_params
-    active_params_int = int(round(active_params))
-    inactive_params_int = max(total_params - active_params_int, 0)
-    print("| -----------------------------")
-    print(
-        f"| Total parameters: {humanize.intword(total_params * world_size)} ({total_params * world_size:,})"
-    )
-    print(
-        f"| Active parameters (MoE top-k): {humanize.intword(active_params_int * world_size)} ({active_params_int * world_size:,})"
-    )
-    print(
-        f"| Inactive parameters (MoE): {humanize.intword(inactive_params_int * world_size)} ({inactive_params_int * world_size:,})"
-    )
-    print(
-        f"| Trainable parameters: {humanize.intword(trainable_params * world_size)} ({trainable_params * world_size:,})"
-    )
-    print(
-        f"| Total parameters per GPU: {humanize.intword(total_params)} ({total_params:,})"
-    )
-    print(
-        f"| Active parameters per GPU (MoE top-k): {humanize.intword(active_params_int)} ({active_params_int:,})"
-    )
-    print(
-        f"| Inactive parameters per GPU (MoE): {humanize.intword(inactive_params_int)} ({inactive_params_int:,})"
-    )
-    print(
-        f"| Trainable parameters per GPU: {humanize.intword(trainable_params)} ({trainable_params:,})"
-    )
+    # 3. Parameters per Block
+    # --- MLA Attention ---
+    mla_down_q = n_embd * q_size
+    mla_down_kv = n_embd * (k_size + rope_size)
+    mla_norms = q_size + k_size
+    mla_up_q = q_size * n_heads * (lat_head_size + rope_size)
+    mla_up_kv = k_size * n_heads * (lat_head_size + head_size)
+    mla_proj = n_heads * head_size * n_embd
+    
+    params_mla = mla_down_q + mla_down_kv + mla_norms + mla_up_q + mla_up_kv + mla_proj
+    
+    # --- MoE (Shared + Routed) ---
+    s_hidden_req = cfg.model.n_shared_experts * cfg.model.expert_hidden_size
+    s_hidden = (s_hidden_req + 255) // 256 * 256 
+    # Gate + Up (swiglu usually 2 matrices) + Down. No bias.
+    params_shared = (n_embd * s_hidden) + (n_embd * s_hidden) + (s_hidden * n_embd)
+    
+    # Routed Experts
+    n_routed = cfg.model.n_routed_experts
+    topk = cfg.model.topk_experts
+    expert_hidden = cfg.model.expert_hidden_size
+    
+    # SwiGLU: (n_embd -> 2*h) + (h -> n_embd) -> 3 * n_embd * h
+    params_per_expert = 3 * n_embd * expert_hidden
+    
+    # MoE Gate
+    params_gate = n_embd * n_routed
+    
+    params_moe_total = params_shared + params_gate + (n_routed * params_per_expert)
+    params_moe_active = params_shared + params_gate + (topk * params_per_expert)
+    
+    # Block Layer Norms
+    params_block_ln = 2 * n_embd
+    
+    # --- Layer Totals ---
+    params_layer_total = params_mla + params_moe_total + params_block_ln
+    params_layer_active = params_mla + params_moe_active + params_block_ln
+    
+    # 4. Final Sums
+    total_params = params_emb + (n_layers * params_layer_total) + params_ln_f
+    active_params = params_emb + (n_layers * params_layer_active) + params_ln_f
+    
+    print("| --------------------------------------------------------------------")
+    print(f"| Config: {cfg.experiment.run_name}")
+    print(f"| Architecture: {n_layers} layers, {n_heads} heads, {n_embd} dim")
+    print(f"| Experts: {n_routed} routed, {cfg.model.n_shared_experts} shared, TopK: {topk}")
+    print("| --------------------------------------------------------------------")
+    print(f"| Total Params (Storage):      {humanize.intword(total_params)} ({total_params:,})")
+    print(f"| Active Params (Forward):     {humanize.intword(active_params)} ({active_params:,})")
+    print(f"| Utilization:                 {active_params/total_params:.1%}")
+    print("| --------------------------------------------------------------------")
 
 def estimate_flops(model, cfg):
-    """ Prints the estimated number of FLOPs per token for the model and for the run. Ref: https://arxiv.org/abs/2204.02311 """
-    nparams = sum(p.numel() for p in model.parameters())
-    nparams_embedding = model.wte.weight.numel()
-    l, h, q, t = cfg.model.n_layers, cfg.model.n_heads, cfg.model.n_embd // cfg.model.n_heads, cfg.model.block_size
-    num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
+    """ Prints the estimated number of FLOPs per token for the model and for the run. """
+    n_layers = cfg.model.n_layers
+    n_embd = cfg.model.n_embd
+    n_heads = cfg.model.n_heads
+    
+    k_size = cfg.model.kv_latent_size
+    q_size = cfg.model.q_latent_size
+    head_size = cfg.model.head_size
+    rope_size = cfg.model.rope_head_size
+    lat_head_size = head_size - rope_size
+    
+    # MLA Params per layer
+    mla_down_q = n_embd * q_size
+    mla_down_kv = n_embd * (k_size + rope_size)
+    mla_norms = q_size + k_size
+    mla_up_q = q_size * n_heads * (lat_head_size + rope_size)
+    mla_up_kv = k_size * n_heads * (lat_head_size + head_size)
+    mla_proj = n_heads * head_size * n_embd
+    params_mla = mla_down_q + mla_down_kv + mla_norms + mla_up_q + mla_up_kv + mla_proj
+    
+    # MoE Active Params per layer
+    s_hidden_req = cfg.model.n_shared_experts * cfg.model.expert_hidden_size
+    s_hidden = (s_hidden_req + 255) // 256 * 256 
+    params_shared = (n_embd * s_hidden) * 3 
+    
+    topk = cfg.model.topk_experts
+    expert_hidden = cfg.model.expert_hidden_size
+    params_per_expert = 3 * n_embd * expert_hidden
+    
+    params_gate = n_embd * cfg.model.n_routed_experts
+    
+    params_moe_active = params_shared + params_gate + (topk * params_per_expert)
+    params_block_ln = 2 * n_embd
+    
+    active_params_per_layer = params_mla + params_moe_active + params_block_ln
+    active_body_params = n_layers * active_params_per_layer
+
+    l, t = n_layers, cfg.model.block_size
+    head_dim = n_embd // n_heads 
+    
+    num_flops_per_token = 6 * active_body_params + 12 * l * n_heads * head_dim * t
+    
     print("| -----------------------------")
     total_tokens = cfg.training.max_steps * cfg.training.batch_size * cfg.model.block_size * cfg.training.grad_accum_steps
-    print(f"| Total tokens to be used for training: {humanize.intword(total_tokens)} ({total_tokens:,}) out of 350 billion in the dataset.")
+    print(f"| Total tokens to be used for training: {humanize.intword(total_tokens)} ({total_tokens:,})")
+    print(f"| Active Body Params (Est): {humanize.intword(active_body_params)} ({active_body_params:,})")
     print(f"| FLOPs per token: {humanize.intword(num_flops_per_token)} ({num_flops_per_token:,}).")
     total_flops = num_flops_per_token * total_tokens
     print(f"| Total FLOPs for the training run: {humanize.intword(total_flops)} ({total_flops:,}).")
     print("| -----------------------------")
 
-def norm(x):
-    # RMS norm
-    return F.rms_norm(x, (x.size(-1),))
-
-# Applies RoPE
 def apply_rotary_emb(x, sin, cos):
-    assert x.ndim == 4 # must be attention
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up the time into two halves
-    with torch.autocast(device_type=x.device.type, dtype=torch.float32):
-        y1 = cos * x1 + sin * x2
-        y2 = (-sin) * x1 + cos * x2
-    out = torch.cat([y1,y2], 3)
-    out = out.to(x.dtype)
-    return out
-
-
-def save_checkpoint(model, run_name, step, val_loss):
-    checkpoint_dir = "output/checkpoints"
-    checkpoint_dir = os.path.join(checkpoint_dir, run_name)
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, f"model_{step:05d}.pt")
-    checkpoint = {
-                    'model': model.state_dict(),
-                    'step': step,
-                    'val_loss': val_loss
-    }
-    # TODO: add optimizer state
-    torch.save(checkpoint, checkpoint_path)
-
-def save_best_checkpoint(model, run_name, step, val_loss):
-    checkpoint_dir = "output/checkpoints"
-    checkpoint_dir = os.path.join(checkpoint_dir, run_name)
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, f"model_best_val.pt")
-    checkpoint = {
-                    'model': model.state_dict(),
-                    'step': step,
-                    'val_loss': val_loss
-    }
-    # TODO: add optimizer state
-    torch.save(checkpoint, checkpoint_path)
-
-def load_checkpoint(model, checkpoint_path, device="cpu"):
-    if not os.path.exists(checkpoint_path):
-        raise ValueError(f"Checkpoint path {checkpoint_path} does not exist.")
+    """
+    Standard RoPE application.
+    Expects x to be (B, H, T, D) or broadcastable.
+    sin, cos are precomputed and passed in.
+    """
+    # x is (B, H, T, head_dim)
+    # chunk into two halves for the rotation
+    d = x.shape[-1] // 2
+    x1 = x[..., :d]
+    x2 = x[..., d:]
     
-    print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = checkpoint['model']
-
-    prefix = '_orig_mod.'
-    new_state_dict = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in state_dict.items()}
-    model.load_state_dict(new_state_dict, strict=True)
-    model = model.to(device)
-
-# helper function for HellaSwag eval
-# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
-def get_most_likely_row(tokens, mask, logits):
-    # evaluate the autoregressive loss at all positions
-    shift_logits = (logits[..., :-1, :]).contiguous()
-    shift_tokens = (tokens[..., 1:]).contiguous()
-    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-    flat_shift_tokens = shift_tokens.view(-1)
-    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
-    shift_losses = shift_losses.view(tokens.size(0), -1)
-    # now get the average loss just for the completion region (where mask == 1), in each row
-    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
-    masked_shift_losses = shift_losses * shift_mask
-    # sum and divide by the number of 1s in the mask
-    sum_loss = masked_shift_losses.sum(dim=1)
-    avg_loss = sum_loss / shift_mask.sum(dim=1)
-    # now we have a loss for each of the 4 completions
-    # the one with the lowest loss should be the most likely
-    pred_norm = avg_loss.argmin().item()
-    return pred_norm
+    # Standard RoPE rotation formula
+    # [-x2, x1] * sin + [x1, x2] * cos
+    return torch.cat((-x2, x1), dim=-1) * sin + x * cos
