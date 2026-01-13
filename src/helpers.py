@@ -2,6 +2,8 @@ import math
 import humanize
 import torch
 import torch.distributed as dist
+import os
+import torch.distributed.checkpoint as dcp
 
 def print_trainable_parameters(cfg):
     """
@@ -143,3 +145,52 @@ def apply_rotary_emb(x, sin, cos):
     # Standard RoPE rotation formula
     # [-x2, x1] * sin + [x1, x2] * cos
     return torch.cat((-x2, x1), dim=-1) * sin + x * cos
+
+def save_checkpoint(self, val_loss, step, is_best=False):
+    checkpoint_path = f"output/checkpoints/{self.config.run_name}/step_{step}"
+    os.makedirs(checkpoint_path, exist_ok=True)
+    
+    if self.rank == 0:
+        print(f"---| Saving checkpoint to {checkpoint_path} |---")
+
+    # Unwrap OptimizedModule if torch.compile is used
+    fsdp_model = self.model
+    if hasattr(self.model, "_orig_mod"):
+        fsdp_model = self.model._orig_mod
+
+    step_tensor = torch.tensor(step) 
+    state_dict = {
+        "model": fsdp_model, 
+        "optimizer": self.optimizer, 
+        "step": step_tensor
+    }
+
+    dcp.save(
+        state_dict=state_dict,
+        storage_writer=dcp.FileSystemWriter(checkpoint_path)
+    )
+
+def load_checkpoint(self, checkpoint_path):
+    if self.rank == 0:
+        print(f"---| Loading checkpoint from {checkpoint_path} |---")
+
+    # Unwrap OptimizedModule if torch.compile is used
+    fsdp_model = self.model
+    if hasattr(self.model, "_orig_mod"):
+        fsdp_model = self.model._orig_mod
+
+    step_tensor = torch.tensor(0) 
+    state_dict = {
+        "model": fsdp_model, 
+        "optimizer": self.optimizer, 
+        "step": step_tensor
+    }
+
+    dcp.load(
+        state_dict=state_dict,
+        storage_reader=dcp.FileSystemReader(checkpoint_path)
+    )
+    
+    self.step = step_tensor.item()
+    if self.rank == 0:
+        print(f"---| Loaded successfully from step {self.step} |---")
