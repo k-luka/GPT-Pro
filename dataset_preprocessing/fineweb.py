@@ -16,7 +16,7 @@ remote_name = "sample-350BT"
 shard_size = int(1e8) # 100M tokens per shard, total of 100 shards
 
 # create cache local dir
-DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
+DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "data", local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
 # download the dataset
