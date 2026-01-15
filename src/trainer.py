@@ -85,7 +85,7 @@ class Trainer:
     def _train_global_batch(self):
         self.optimizer.zero_grad()
         for param in self.model.parameters():
-            if param.requires_grad() and hasattr(param, "main_grad"):
+            if param.requires_grad and hasattr(param, "main_grad"):
                 param.main_grad.zero_()
 
         loss_accum = 0.0
@@ -99,14 +99,14 @@ class Trainer:
             loss.backward()
             # Calculate gradients in bf16 but accumulate gradients in float32
             for param in self.model.parameters():
-                if param.requires_grad() and hasattr(param, "main_grad") and param.grad is not None:
-                    param.main_grad = param.grad.float()
+                if param.requires_grad and hasattr(param, "main_grad") and param.grad is not None:
+                    param.main_grad.add_(param.grad)
                     param.grad = None # Immediatly let go of the bf16 grads to free memory
         
         # Reassign the accumulated gradients
         for param in self.model.parameters():
-            if param.requiers_grad() and hasattr(param, "main_grad"):
-                param.grad = param.main_grad
+            if param.requiers_grad and hasattr(param, "main_grad"):
+                param.grad = param.main_grad.to(param.dtype)
 
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) # gradient clipping
         self.optimizer.step()

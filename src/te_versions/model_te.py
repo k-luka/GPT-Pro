@@ -9,6 +9,7 @@ import transformer_engine.pytorch as te
 import json
 import os
 
+
 class MLA(nn.Module):
     def __init__(
         self,
@@ -32,10 +33,10 @@ class MLA(nn.Module):
         # Fused Down-Projection
         # Projects x into ALL latent vectors at once: (Q_latent | KV_latent | K_rope)
         self.w_down = te.Linear(
-            n_embd, 
-            q_latent_size + kv_latent_size + rope_head_size, 
-            bias=False, 
-            params_dtype=dtype
+            n_embd,
+            q_latent_size + kv_latent_size + rope_head_size,
+            bias=False,
+            params_dtype=dtype,
         )
 
         self.q_norm = te.RMSNorm(q_latent_size, params_dtype=dtype)
@@ -58,20 +59,17 @@ class MLA(nn.Module):
         self.proj = te.Linear(
             n_heads * head_size, n_embd, bias=False, params_dtype=dtype
         )
-        self.proj.RESIDUAL_SCALE_INIT_FACTOR = True 
+        self.proj.RESIDUAL_SCALE_INIT_FACTOR = True
 
     def forward(self, x, sin, cos):
         B, T, _ = x.shape
         H = self.n_heads
         d_c = self.latent_head_size
-        d_r = self.rope_head_size
-        d = self.head_size
 
         # Fused Projection & Split
         fused_down = self.w_down(x)
         c_q, c_kv, k_rope = fused_down.split(
-            [self.q_latent_size, self.kv_latent_size, self.rope_head_size], 
-            dim=-1
+            [self.q_latent_size, self.kv_latent_size, self.rope_head_size], dim=-1
         )
 
         # Normalization
@@ -87,23 +85,23 @@ class MLA(nn.Module):
         q_lr = self.w_up_qr(c_q).view(B, T, H, -1).transpose(1, 2)
         q_l = q_lr[..., :d_c]
         q_r = q_lr[..., d_c:]
-        
+
         q_r = apply_rotary_emb(q_r, sin, cos)
-        q = torch.cat((q_l, q_r), dim=-1) # (B, H, T, head_size)
+        q = torch.cat((q_l, q_r), dim=-1)  # (B, H, T, head_size)
 
         # Generate Key/Value (K, V)
         # Project up -> Split into Key-Content & Value
         kv = self.w_up_kv(c_kv).view(B, T, H, -1).transpose(1, 2)
-        
+
         k_l = kv[..., :d_c]
-        v   = kv[..., d_c:] # Value is ready
-        
+        v = kv[..., d_c:]  # Value is ready
+
         # Combine Key-Content with the Shared RoPE Key
         k = torch.cat((k_l, k_rope.expand(B, H, T, -1)), dim=-1)
 
         # Attention
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            
+
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.proj(out)
 
@@ -112,35 +110,31 @@ class MLA(nn.Module):
 class Attention(nn.Module):
     def __init__(self, n_embd, n_heads, dtype=None):
         super().__init__()
-        assert (
-            n_embd % n_heads == 0
-        ), f"Embedding dim ({n_embd}) must be divisible by number of heads ({n_heads})."
+        assert n_embd % n_heads == 0, (
+            f"Embedding dim ({n_embd}) must be divisible by number of heads ({n_heads})."
+        )
         self.n_embd = n_embd
         self.n_heads = n_heads
         self.H = n_embd // n_heads  # head size
-        self.attn = te.Linear(
-            n_embd, 3 * n_embd, bias=False, params_dtype=dtype
-        )
-        self.proj = te.Linear(
-            n_embd, n_embd, bias=False, params_dtype=dtype
-        )
+        self.attn = te.Linear(n_embd, 3 * n_embd, bias=False, params_dtype=dtype)
+        self.proj = te.Linear(n_embd, n_embd, bias=False, params_dtype=dtype)
         self.q_norm = te.RMSNorm(self.H, params_dtype=dtype)
         self.k_norm = te.RMSNorm(self.H, params_dtype=dtype)
         self.proj.RESIDUAL_SCALE_INIT_FACTOR = True
 
     def forward(self, x, sin, cos):
         B, T, C = x.shape
-        q, k, v = self.attn(x).split(self.n_embd, dim=-1)  
-        q = q.view(B, T, self.n_heads, self.H).transpose(1, 2)  
+        q, k, v = self.attn(x).split(self.n_embd, dim=-1)
+        q = q.view(B, T, self.n_heads, self.H).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.H).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.H).transpose(1, 2)
         # Apply RoPE
         q = apply_rotary_emb(q, sin, cos)
         k = apply_rotary_emb(k, sin, cos)
         q, k = self.q_norm(q), self.k_norm(k)
-        
+
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            
+
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.proj(out)
 
@@ -171,6 +165,7 @@ class MLP(nn.Module):
         x = self.down_proj(x)
         return x
 
+
 # Same as MLP but takes a parameter for hidden_size
 class SharedExpert(nn.Module):
     def __init__(self, n_embd, hidden_size, dtype=None):
@@ -194,6 +189,7 @@ class SharedExpert(nn.Module):
         x = gate * self.up_proj(x)
         return self.down_proj(x)
 
+
 # Decides which experts will be used
 class Gate(nn.Module):
     def __init__(self, n_embd, topk, n_routed_experts, route_scale=1.0, dtype=None):
@@ -209,7 +205,7 @@ class Gate(nn.Module):
         scores = logits.sigmoid()
 
         # Break the link between the computation and the storage buffer.
-        bias_term = self.bias.detach() # pyrefly: ignore
+        bias_term = self.bias.detach()  # pyrefly: ignore
 
         topk_idx = torch.topk(scores + bias_term, self.topk, dim=-1)[1].to(
             dtype=torch.int32
@@ -219,9 +215,18 @@ class Gate(nn.Module):
         weights = (weights / weights.sum(-1, keepdim=True)) * self.route_scale
         return topk_idx, weights
 
+
 # Processes all experts in parallel
 class MoE(nn.Module):
-    def __init__(self, n_embd, n_shared_experts, n_routed_experts, topk, expert_hidden_size, dtype=None):
+    def __init__(
+        self,
+        n_embd,
+        n_shared_experts,
+        n_routed_experts,
+        topk,
+        expert_hidden_size,
+        dtype=None,
+    ):
         super().__init__()
         self.n_embd = n_embd
         self.n_shared_experts = n_shared_experts
@@ -233,7 +238,7 @@ class MoE(nn.Module):
         )
         self.routed_fused_proj = te.GroupedLinear(
             in_features=n_embd,
-            out_features=expert_hidden_size * 2,
+            out_features=expert_hidden_size * n_shared_experts,
             num_gemms=n_routed_experts,
             bias=False,
             params_dtype=dtype,
@@ -255,11 +260,11 @@ class MoE(nn.Module):
         total_tokens = global_count.sum()
         actual_load = global_count.float() / total_tokens if total_tokens != 0 else 0
         target_load = 1 / self.n_routed_experts
-        
+
         # Determine correction direction
         correction = torch.sign(target_load - actual_load)
-        
-        self.gate.bias.add_(update_rate * correction) # pyrefly: ignore
+
+        self.gate.bias.add_(update_rate * correction)  # pyrefly: ignore
 
     def forward(self, x):
         B, T, C = x.shape
@@ -271,29 +276,31 @@ class MoE(nn.Module):
 
         permuted_x, permuted_map = te.moe_permute(x_flat, topk_idx, map_type="index")
 
-        # 1. Calculate Local Counts
+        # Calculate Local Counts
         tokens_per_expert = torch.bincount(
             topk_idx.flatten(), minlength=self.n_routed_experts
         )
         local_tokens_per_expert_list = tokens_per_expert.tolist()
-        
-        # 2. Global Sync & Update
+
+        # Global Sync & Update
         if self.training:
             if dist.is_initialized():
                 dist.all_reduce(tokens_per_expert, op=dist.ReduceOp.SUM)
-            
+
             # Save for Logger (Detached CPU list for safety/speed)
             self.last_global_counts = tokens_per_expert.detach().cpu().tolist()
-            
-            # Update bias 
+
+            # Update bias
             self.update_bias(tokens_per_expert)
 
         routed_up_proj, routed_gate = self.routed_fused_proj(
             permuted_x, m_splits=local_tokens_per_expert_list
         ).chunk(2, dim=-1)
         permuted_up_x = routed_up_proj * F.silu(routed_gate)
-        permuted_y = self.routed_down_proj(permuted_up_x, m_splits=local_tokens_per_expert_list)
-        
+        permuted_y = self.routed_down_proj(
+            permuted_up_x, m_splits=local_tokens_per_expert_list
+        )
+
         routed = te.moe_unpermute(
             permuted_y,
             permuted_map,
@@ -333,7 +340,12 @@ class Block(nn.Module):
         )
         self.ln2 = te.RMSNorm(n_embd, params_dtype=dtype)
         self.moe = MoE(
-            n_embd, n_shared_experts, n_routed_experts, topk, expert_hidden_size, dtype=dtype
+            n_embd,
+            n_shared_experts,
+            n_routed_experts,
+            topk,
+            expert_hidden_size,
+            dtype=dtype,
         )
 
     def forward(self, x, sin, cos):
@@ -362,7 +374,7 @@ class GPT(nn.Module):
         dtype,
     ):
         super().__init__()
-        self.dtype=dtype
+        self.dtype = dtype
         self.block_size = block_size
         self.n_embd = n_embd
         self.n_layers = n_layers
@@ -381,7 +393,7 @@ class GPT(nn.Module):
                     kv_latent_size,
                     q_latent_size,
                     n_shared_experts,
-                    n_routed_experts, 
+                    n_routed_experts,
                     topk_experts,
                     expert_hidden_size,
                     dtype=dtype,
@@ -407,18 +419,18 @@ class GPT(nn.Module):
             return
 
         os.makedirs("output/expert_stats", exist_ok=True)
-        
+
         # Collect data
         batch_log = []
         for i, block in enumerate(self.transformer):
-            if block.moe.last_global_counts is not None: # pyrefly: ignore
+            if block.moe.last_global_counts is not None:  # pyrefly: ignore
                 entry = {
                     "step": self.step_counter,
                     "layer": i,
-                    "counts": block.moe.last_global_counts
+                    "counts": block.moe.last_global_counts,
                 }
                 batch_log.append(json.dumps(entry))
-        
+
         # Bulk write
         if batch_log:
             with open("output/expert_stats/layer_loads.jsonl", "a") as f:
@@ -431,40 +443,40 @@ class GPT(nn.Module):
         if isinstance(module, (nn.Linear, te.Linear, nn.Embedding)):
             if hasattr(module, "RESIDUAL_SCALE_INIT_FACTOR"):
                 std *= 1 / (math.sqrt(2 * self.n_layers))
-            
+
             # These modules all have a standard .weight attribute
             if hasattr(module, "weight"):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=std) # pyrefly: ignore
-            
+                torch.nn.init.normal_(module.weight, mean=0.0, std=std)  # pyrefly: ignore
+
             if hasattr(module, "bias") and module.bias is not None:
-                torch.nn.init.zeros_(module.bias) # pyrefly: ignore
+                torch.nn.init.zeros_(module.bias)  # pyrefly: ignore
 
         # 2. Handle GroupedLinear (MoE Experts) - It uses 'weight0'
         elif isinstance(module, te.GroupedLinear):
             if hasattr(module, "weight"):
                 # Just in case future versions use 'weight'
-                torch.nn.init.normal_(module.weight, mean=0.0, std=std) # pyrefly: ignore
+                torch.nn.init.normal_(module.weight, mean=0.0, std=std)  # pyrefly: ignore
             elif hasattr(module, "weight0"):
                 # THIS IS THE FIX: Initialize weight0
-                torch.nn.init.normal_(module.weight0, mean=0.0, std=std) # pyrefly: ignore
-            
+                torch.nn.init.normal_(module.weight0, mean=0.0, std=std)  # pyrefly: ignore
+
             # It usually doesn't have bias in MoE, but safe
             if hasattr(module, "bias") and module.bias is not None:
-                torch.nn.init.zeros_(module.bias) # pyrefly: ignore
+                torch.nn.init.zeros_(module.bias)  # pyrefly: ignore
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        assert (
-            T <= self.block_size
-        ), f"Sequence length ({T}) is longer than the block_size ({self.block_size})."
+        assert T <= self.block_size, (
+            f"Sequence length ({T}) is longer than the block_size ({self.block_size})."
+        )
         x = self.wte(idx)
-        sin = self.sin[:, :, :T, :] # pyrefly: ignore
-        cos = self.cos[:, :, :T, :] # pyrefly: ignore
+        sin = self.sin[:, :, :T, :]  # pyrefly: ignore
+        cos = self.cos[:, :, :T, :]  # pyrefly: ignore
 
         for block in self.transformer:
             x = block(x, sin, cos)
         x = self.ln(x)
-        
+
         if self.training:
             self.step_counter += 1
             if self.rank == 0:
@@ -492,7 +504,7 @@ class GPT(nn.Module):
 
         for _ in range(max_tokens):
             logits, _ = self.forward(idx)
-            logits = logits[:, -1, :] # pyrefly: ignore
+            logits = logits[:, -1, :]  # pyrefly: ignore
             probs = F.softmax(logits, dim=-1)
             topk_probs, topk_indices = torch.topk(probs, k=topk)
             idx_next = torch.multinomial(topk_probs, num_samples=1)
@@ -521,19 +533,23 @@ class GPT(nn.Module):
                     nodecay_params.append(p)
 
         optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
         ]
 
         if self.rank == 0:
             print(f"Decayed params: {sum(p.numel() for p in decay_params):,}")
             print(f"No-decay params: {sum(p.numel() for p in nodecay_params):,}")
 
-        use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+        use_fused = (device_type == "cuda") and (
+            "fused" in inspect.signature(torch.optim.AdamW).parameters
+        )
         if self.rank == 0:
             print(f"Using fused AdamW: {use_fused}")
 
-        return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), fused=use_fused)
+        return torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=(0.9, 0.95), fused=use_fused
+        )
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
