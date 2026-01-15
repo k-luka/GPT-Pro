@@ -79,12 +79,10 @@ def main(cfg: DictConfig):
         model,
         auto_wrap_policy=get_auto_wrap_policy(),
         device_id=device_obj,
-        # Recommended FSDP settings for BF16 mixed precision if needed:
-        # mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, ...),
+        use_orig_params=True
     )
 
-    # Compile usually works best after FSDP in recent PyTorch versions
-    model = torch.compile(model)
+    # model = torch.compile(model)
 
     # trainer
     trainer_config = TrainerConfig(

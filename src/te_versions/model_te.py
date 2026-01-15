@@ -67,22 +67,22 @@ class MLA(nn.Module):
         d_r = self.rope_head_size
         d = self.head_size
 
-        # 1. Fused Projection & Split
+        # Fused Projection & Split
         fused_down = self.w_down(x)
         c_q, c_kv, k_rope = fused_down.split(
             [self.q_latent_size, self.kv_latent_size, self.rope_head_size], 
             dim=-1
         )
 
-        # 2. Normalization
+        # Normalization
         c_q = self.q_norm(c_q)
         c_kv = self.kv_norm(c_kv)
 
-        # 3. RoPE Shared Key (Optimization: Rotate the tiny shared key once)
+        # RoPE Shared Key (Optimization: Rotate the tiny shared key once)
         # Reshape to (B, 1, T, 64) so it broadcasts to all heads later
         k_rope = apply_rotary_emb(k_rope.unsqueeze(1), sin, cos)
 
-        # 4. Generate Query (Q)
+        # Generate Query (Q)
         # Project up -> Split into Content & RoPE parts
         q_lr = self.w_up_qr(c_q).view(B, T, H, -1).transpose(1, 2)
         q_l = q_lr[..., :d_c]
@@ -91,7 +91,7 @@ class MLA(nn.Module):
         q_r = apply_rotary_emb(q_r, sin, cos)
         q = torch.cat((q_l, q_r), dim=-1) # (B, H, T, head_size)
 
-        # 5. Generate Key/Value (K, V)
+        # Generate Key/Value (K, V)
         # Project up -> Split into Key-Content & Value
         kv = self.w_up_kv(c_kv).view(B, T, H, -1).transpose(1, 2)
         
@@ -99,11 +99,9 @@ class MLA(nn.Module):
         v   = kv[..., d_c:] # Value is ready
         
         # Combine Key-Content with the Shared RoPE Key
-        # We expand k_rope to match the number of heads (H)
         k = torch.cat((k_l, k_rope.expand(B, H, T, -1)), dim=-1)
 
-        # 6. Attention
-        # Force Flash Attention for speed
+        # Attention
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
@@ -203,7 +201,7 @@ class Gate(nn.Module):
         self.n_embd = n_embd
         self.topk = topk
         self.route_scale = route_scale
-        self.weight = te.Linear(n_embd, n_routed_experts, bias=False, params_dtype=dtype)
+        self.weight = nn.Linear(n_embd, n_routed_experts, bias=False, dtype=dtype)
         self.register_buffer("bias", torch.zeros(n_routed_experts, dtype=dtype))
 
     def forward(self, x) -> tuple[torch.Tensor, torch.Tensor]:
@@ -383,7 +381,7 @@ class GPT(nn.Module):
                     kv_latent_size,
                     q_latent_size,
                     n_shared_experts,
-                    n_routed_experts,
+                    n_routed_experts, 
                     topk_experts,
                     expert_hidden_size,
                     dtype=dtype,
@@ -392,7 +390,7 @@ class GPT(nn.Module):
             ]
         )
         self.ln = te.RMSNorm(n_embd, params_dtype=dtype)
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False, dtype=dtype)
         self.wte.weight = (
             self.lm_head.weight
         )  # Embedding layer and final calssifier are the same
@@ -429,14 +427,30 @@ class GPT(nn.Module):
     # initialize weights
     def _init_weights(self, module):
         std = 0.015
-        if isinstance(module, (nn.Linear, te.Linear, te.GroupedLinear)):
+        # Handle standard layers (Linear, TE Linear, Embedding)
+        if isinstance(module, (nn.Linear, te.Linear, nn.Embedding)):
             if hasattr(module, "RESIDUAL_SCALE_INIT_FACTOR"):
                 std *= 1 / (math.sqrt(2 * self.n_layers))
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std) # pyrefly: ignore
-            if module.bias is not None:
+            
+            # These modules all have a standard .weight attribute
+            if hasattr(module, "weight"):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=std) # pyrefly: ignore
+            
+            if hasattr(module, "bias") and module.bias is not None:
                 torch.nn.init.zeros_(module.bias) # pyrefly: ignore
-        if isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+
+        # 2. Handle GroupedLinear (MoE Experts) - It uses 'weight0'
+        elif isinstance(module, te.GroupedLinear):
+            if hasattr(module, "weight"):
+                # Just in case future versions use 'weight'
+                torch.nn.init.normal_(module.weight, mean=0.0, std=std) # pyrefly: ignore
+            elif hasattr(module, "weight0"):
+                # THIS IS THE FIX: Initialize weight0
+                torch.nn.init.normal_(module.weight0, mean=0.0, std=std) # pyrefly: ignore
+            
+            # It usually doesn't have bias in MoE, but safe
+            if hasattr(module, "bias") and module.bias is not None:
+                torch.nn.init.zeros_(module.bias) # pyrefly: ignore
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -528,6 +542,7 @@ class GPT(nn.Module):
         inv_freq = 1.0 / (base ** (channel_range / head_dim))
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
+        freqs = torch.cat((freqs, freqs), dim=-1)
         sin, cos = freqs.sin(), freqs.cos()
         sin, cos = sin.bfloat16(), cos.bfloat16()
         sin, cos = sin[None, None, :, :], cos[None, None, :, :]
