@@ -68,6 +68,10 @@ class Trainer:
         self.tokenizer = tokenizer
         self.step = 0
 
+        for param in self.model.parameters():
+            if param.requires_grad:
+                param.main_grad = torch.zeros_like(param, dtype=torch.float32)
+
     def get_lr(self, it):
         if it < self.config.warmup_steps:
             return self.config.max_lr * it / self.config.warmup_steps
@@ -80,6 +84,10 @@ class Trainer:
 
     def _train_global_batch(self):
         self.optimizer.zero_grad()
+        for param in self.model.parameters():
+            if param.requires_grad() and hasattr(param, "main_grad"):
+                param.main_grad.zero_()
+
         loss_accum = 0.0
         for step in range(self.config.grad_accum_steps):
             x, y = next(self.train_loader)
@@ -89,6 +97,17 @@ class Trainer:
             loss = loss / self.config.grad_accum_steps # scale loss as otherwise it would accumulate
             loss_accum += loss.detach()
             loss.backward()
+            # Calculate gradients in bf16 but accumulate gradients in float32
+            for param in self.model.parameters():
+                if param.requires_grad() and hasattr(param, "main_grad") and param.grad is not None:
+                    param.main_grad = param.grad.float()
+                    param.grad = None # Immediatly let go of the bf16 grads to free memory
+        
+        # Reassign the accumulated gradients
+        for param in self.model.parameters():
+            if param.requiers_grad() and hasattr(param, "main_grad"):
+                param.grad = param.main_grad
+
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) # gradient clipping
         self.optimizer.step()
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)

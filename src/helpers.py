@@ -5,7 +5,7 @@ import torch.distributed as dist
 import os
 import torch.distributed.checkpoint as dcp
 
-def print_trainable_parameters(cfg):
+def print_trainable_parameters(cfg, model):
     """
     Estimates parameters based on configuration.
     """
@@ -67,6 +67,10 @@ def print_trainable_parameters(cfg):
     # 4. Final Sums
     total_params = params_emb + (n_layers * params_layer_total) + params_ln_f
     active_params = params_emb + (n_layers * params_layer_active) + params_ln_f
+
+    params_per_shard = 0
+    for i,param in enumerate(model.parameters()):
+        params_per_shard += param.numel()
     
     print("| --------------------------------------------------------------------")
     print(f"| Config: {cfg.experiment.run_name}")
@@ -75,8 +79,8 @@ def print_trainable_parameters(cfg):
     print("| --------------------------------------------------------------------")
     print(f"| Total Params (Storage):      {humanize.intword(total_params)} ({total_params:,})")
     print(f"| Active Params (Forward):     {humanize.intword(active_params)} ({active_params:,})")
+    print(f"| True Params per GPU:         {humanize.intword(params_per_shard)} ({params_per_shard:,})")
     print(f"| Utilization:                 {active_params/total_params:.1%}")
-    print("| --------------------------------------------------------------------")
 
 def estimate_flops(cfg):
     """ Prints the estimated number of FLOPs per token for the model and for the run. """
@@ -121,14 +125,13 @@ def estimate_flops(cfg):
     
     num_flops_per_token = 6 * active_body_params + 12 * l * n_heads * head_dim * t
     
-    print("| -----------------------------")
+    print("| --------------------------------------------------------------------")
     total_tokens = cfg.training.max_steps * cfg.training.batch_size * cfg.model.block_size * cfg.training.grad_accum_steps
     print(f"| Total tokens to be used for training: {humanize.intword(total_tokens)} ({total_tokens:,})")
-    print(f"| Active Body Params (Est): {humanize.intword(active_body_params)} ({active_body_params:,})")
     print(f"| FLOPs per token: {humanize.intword(num_flops_per_token)} ({num_flops_per_token:,}).")
     total_flops = num_flops_per_token * total_tokens
     print(f"| Total FLOPs for the training run: {humanize.intword(total_flops)} ({total_flops:,}).")
-    print("| -----------------------------")
+    print("| --------------------------------------------------------------------")
 
 def apply_rotary_emb(x, sin, cos):
     """

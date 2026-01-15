@@ -9,6 +9,7 @@ import functools
 import os
 import wandb
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import torch.distributed as dist
 
@@ -53,6 +54,12 @@ def main(cfg: DictConfig):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+    mp_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        buffer_dtype=torch.float32,
+    )
+
 
     # Define model
     model = GPT(
@@ -79,7 +86,8 @@ def main(cfg: DictConfig):
         model,
         auto_wrap_policy=get_auto_wrap_policy(),
         device_id=device_obj,
-        use_orig_params=True
+        use_orig_params=True,
+        mixed_precision=mp_policy,
     )
 
     # model = torch.compile(model)
@@ -115,7 +123,7 @@ def main(cfg: DictConfig):
     )
 
     if master_rank:
-        print_trainable_parameters(cfg) 
+        print_trainable_parameters(cfg, model) 
         estimate_flops(cfg)
 
     # check if training from checkpoint
