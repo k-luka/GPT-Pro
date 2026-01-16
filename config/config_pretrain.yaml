@@ -9,19 +9,19 @@ experiment:
 model:
   vocab_size: 50304
   block_size: 2048
-  n_embd: 2048
+  n_embd: 2560
   n_layers: 27
   n_heads: 32
   head_size: 192
   rope_head_size: 64
   kv_latent_size: 512
-  q_latent_size: 2048
+  q_latent_size: 2560
   
   # MoE Settings
   n_shared_experts: 2
-  n_routed_experts: 48
+  n_routed_experts: 40
   topk_experts: 8
-  expert_hidden_size: 1024
+  expert_hidden_size: 768
 
 data:
   train_data_root: "data/edu_fineweb350B/"
@@ -29,7 +29,7 @@ data:
 
 training:
   batch_size: 8
-  grad_accum_steps: 8
+  grad_accum_steps: 16
 
   # Logistics
   logging_steps: 1

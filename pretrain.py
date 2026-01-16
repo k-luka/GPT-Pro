@@ -88,7 +88,7 @@ def main(cfg: DictConfig):
         device_id=device_obj,
         use_orig_params=True,
         mixed_precision=mp_policy,
-        sharding_strategy=ShardingStrategy.HYBRID_SHARD
+        sharding_strategy=ShardingStrategy.FULL_SHARD
     )
 
     # model = torch.compile(model)
