@@ -257,14 +257,14 @@ class MoE(nn.Module):
         """
         DeepSeek Auxiliary-Loss-Free Load Balancing.
         """
-        total_tokens = global_count.sum()
-        actual_load = global_count.float() / total_tokens if total_tokens != 0 else 0
-        target_load = 1 / self.n_routed_experts
+        with torch.no_grad():
+            total_tokens = global_count.sum()
+            actual_load = global_count.float() / total_tokens if total_tokens != 0 else 0
+            target_load = 1 / self.n_routed_experts
 
-        # Determine correction direction
-        correction = torch.sign(target_load - actual_load)
-
-        self.gate.bias.add_(update_rate * correction)  # pyrefly: ignore
+            # Determine correction direction
+            correction = torch.sign(target_load - actual_load)
+            self.gate.bias.add_(update_rate * correction)  # pyrefly: ignore
 
     def forward(self, x):
         B, T, C = x.shape

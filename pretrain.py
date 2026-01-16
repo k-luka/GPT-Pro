@@ -9,7 +9,7 @@ import functools
 import os
 import wandb
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import torch.distributed as dist
 
@@ -88,6 +88,7 @@ def main(cfg: DictConfig):
         device_id=device_obj,
         use_orig_params=True,
         mixed_precision=mp_policy,
+        sharding_strategy=ShardingStrategy.HYBRID_SHARD
     )
 
     # model = torch.compile(model)

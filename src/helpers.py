@@ -126,7 +126,15 @@ def estimate_flops(cfg):
     num_flops_per_token = 6 * active_body_params + 12 * l * n_heads * head_dim * t
     
     print("| --------------------------------------------------------------------")
-    total_tokens = cfg.training.max_steps * cfg.training.batch_size * cfg.model.block_size * cfg.training.grad_accum_steps
+    
+    # Account for world_size (number of GPUs)
+    world_size = 1
+    if dist.is_initialized():
+        world_size = dist.get_world_size()
+
+    # Assuming cfg.training.batch_size is PER-DEVICE batch size
+    total_tokens = cfg.training.max_steps * cfg.training.batch_size * cfg.model.block_size * cfg.training.grad_accum_steps * world_size
+    
     print(f"| Total tokens to be used for training: {humanize.intword(total_tokens)} ({total_tokens:,})")
     print(f"| FLOPs per token: {humanize.intword(num_flops_per_token)} ({num_flops_per_token:,}).")
     total_flops = num_flops_per_token * total_tokens

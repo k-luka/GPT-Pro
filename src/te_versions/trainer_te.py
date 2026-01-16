@@ -208,7 +208,7 @@ class Trainer:
             # eval loss and report it
             val_loss = None
             if step % self.config.eval_interval == 0:
-                val_loss = estimate_loss(
+                val_loss = estim     ate_loss(
                     self.model,
                     self.val_loader,
                     self.config.eval_steps,
