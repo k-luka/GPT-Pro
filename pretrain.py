@@ -60,7 +60,6 @@ def main(cfg: DictConfig):
         buffer_dtype=torch.float32,
     )
 
-
     # Define model
     model = GPT(
         n_embd = cfg.model.n_embd,

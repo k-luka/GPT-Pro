@@ -8,7 +8,11 @@ import torch.distributed as dist
 import transformer_engine.pytorch as te
 import json
 import os
+from transformer_engine.common.recipe import Format, DelayedScaling, MXFP8BlockScaling
 
+fp8_format = Format.HYBRID  
+mxfp8_format = Format.E4M3
+mxfp8_recipe = MXFP8BlockScaling(fp8_format=fp8_format)
 
 class MLA(nn.Module):
     def __init__(
@@ -36,7 +40,7 @@ class MLA(nn.Module):
             n_embd,
             q_latent_size + kv_latent_size + rope_head_size,
             bias=False,
-            params_dtype=dtype,
+            params_dtype=dtype,  
         )
 
         self.q_norm = te.RMSNorm(q_latent_size, params_dtype=dtype)
@@ -67,14 +71,16 @@ class MLA(nn.Module):
         d_c = self.latent_head_size
 
         # Fused Projection & Split
-        fused_down = self.w_down(x)
+        with te.autocast(recipe=mxfp8_recipe):
+            fused_down = self.w_down(x)
         c_q, c_kv, k_rope = fused_down.split(
             [self.q_latent_size, self.kv_latent_size, self.rope_head_size], dim=-1
         )
 
         # Normalization
-        c_q = self.q_norm(c_q)
-        c_kv = self.kv_norm(c_kv)
+        with te.autocast(recipe=mxfp8_recipe):
+            c_q = self.q_norm(c_q)
+            c_kv = self.kv_norm(c_kv)
 
         # RoPE Shared Key (Optimization: Rotate the tiny shared key once)
         # Reshape to (B, 1, T, 64) so it broadcasts to all heads later
@@ -82,7 +88,8 @@ class MLA(nn.Module):
 
         # Generate Query (Q)
         # Project up -> Split into Content & RoPE parts
-        q_lr = self.w_up_qr(c_q).view(B, T, H, -1).transpose(1, 2)
+        with te.autocast(recipe=mxfp8_recipe):
+            q_lr = self.w_up_qr(c_q).view(B, T, H, -1).transpose(1, 2)
         q_l = q_lr[..., :d_c]
         q_r = q_lr[..., d_c:]
 
@@ -91,7 +98,8 @@ class MLA(nn.Module):
 
         # Generate Key/Value (K, V)
         # Project up -> Split into Key-Content & Value
-        kv = self.w_up_kv(c_kv).view(B, T, H, -1).transpose(1, 2)
+        with te.autocast(recipe=mxfp8_recipe):
+            kv = self.w_up_kv(c_kv).view(B, T, H, -1).transpose(1, 2)
 
         k_l = kv[..., :d_c]
         v = kv[..., d_c:]  # Value is ready
@@ -201,7 +209,8 @@ class Gate(nn.Module):
         self.register_buffer("bias", torch.zeros(n_routed_experts, dtype=dtype))
 
     def forward(self, x) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = self.weight(x)
+        with te.autocast(recipe=mxfp8_recipe):
+            logits = self.weight(x)
         scores = logits.sigmoid()
 
         # Break the link between the computation and the storage buffer.
@@ -269,8 +278,8 @@ class MoE(nn.Module):
     def forward(self, x):
         B, T, C = x.shape
         x_flat = x.view(-1, C)
-
-        shared = self.shared_experts(x)
+        with te.autocast(recipe=mxfp8_recipe):
+            shared = self.shared_experts(x)
 
         topk_idx, weights = self.gate(x_flat)
 
