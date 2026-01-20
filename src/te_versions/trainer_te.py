@@ -245,8 +245,16 @@ class Trainer:
 
     def save_checkpoint(self, val_loss, step, is_best=False):
         """Saves a checkpoint using PyTorch DCP"""
+        if is_best==True:
+            checkpoint_path = f"output/checkpoints/{self.config.run_name}/best_val"
+            if self.rank == 0 and os.path.exists(checkpoint_path):
+                import shutil
+                shutil.rmtree(checkpoint_path)
+            # Synchronize: all ranks must wait for rank 0 to finish deleting
+            dist.barrier()
+        else:
+            checkpoint_path = f"output/checkpoints/{self.config.run_name}/step_{step}"
 
-        checkpoint_path = f"output/checkpoints/{self.config.run_name}/step_{step}"
         os.makedirs(checkpoint_path, exist_ok=True)
         if self.rank == 0:
             print(f"---| Saving checkpoint to {checkpoint_path} |---")

@@ -8,11 +8,7 @@ import torch.distributed as dist
 import transformer_engine.pytorch as te
 import json
 import os
-from transformer_engine.common.recipe import Format, DelayedScaling, MXFP8BlockScaling
 
-fp8_format = Format.HYBRID  
-mxfp8_format = Format.E4M3
-mxfp8_recipe = MXFP8BlockScaling(fp8_format=fp8_format)
 
 class MLA(nn.Module):
     def __init__(
@@ -71,16 +67,14 @@ class MLA(nn.Module):
         d_c = self.latent_head_size
 
         # Fused Projection & Split
-        with te.autocast(recipe=mxfp8_recipe):
-            fused_down = self.w_down(x)
+        fused_down = self.w_down(x)
         c_q, c_kv, k_rope = fused_down.split(
             [self.q_latent_size, self.kv_latent_size, self.rope_head_size], dim=-1
         )
 
         # Normalization
-        with te.autocast(recipe=mxfp8_recipe):
-            c_q = self.q_norm(c_q)
-            c_kv = self.kv_norm(c_kv)
+        c_q = self.q_norm(c_q)
+        c_kv = self.kv_norm(c_kv)
 
         # RoPE Shared Key (Optimization: Rotate the tiny shared key once)
         # Reshape to (B, 1, T, 64) so it broadcasts to all heads later
@@ -88,8 +82,7 @@ class MLA(nn.Module):
 
         # Generate Query (Q)
         # Project up -> Split into Content & RoPE parts
-        with te.autocast(recipe=mxfp8_recipe):
-            q_lr = self.w_up_qr(c_q).view(B, T, H, -1).transpose(1, 2)
+        q_lr = self.w_up_qr(c_q).view(B, T, H, -1).transpose(1, 2)
         q_l = q_lr[..., :d_c]
         q_r = q_lr[..., d_c:]
 
@@ -98,8 +91,7 @@ class MLA(nn.Module):
 
         # Generate Key/Value (K, V)
         # Project up -> Split into Key-Content & Value
-        with te.autocast(recipe=mxfp8_recipe):
-            kv = self.w_up_kv(c_kv).view(B, T, H, -1).transpose(1, 2)
+        kv = self.w_up_kv(c_kv).view(B, T, H, -1).transpose(1, 2)
 
         k_l = kv[..., :d_c]
         v = kv[..., d_c:]  # Value is ready
@@ -209,8 +201,7 @@ class Gate(nn.Module):
         self.register_buffer("bias", torch.zeros(n_routed_experts, dtype=dtype))
 
     def forward(self, x) -> tuple[torch.Tensor, torch.Tensor]:
-        with te.autocast(recipe=mxfp8_recipe):
-            logits = self.weight(x)
+        logits = self.weight(x)
         scores = logits.sigmoid()
 
         # Break the link between the computation and the storage buffer.
@@ -278,8 +269,7 @@ class MoE(nn.Module):
     def forward(self, x):
         B, T, C = x.shape
         x_flat = x.view(-1, C)
-        with te.autocast(recipe=mxfp8_recipe):
-            shared = self.shared_experts(x)
+        shared = self.shared_experts(x)
 
         topk_idx, weights = self.gate(x_flat)
 
@@ -319,6 +309,163 @@ class MoE(nn.Module):
         )
         return shared + routed.view(B, T, C)
 
+class ExpertParallelMoE(nn.Module):
+    def __init__(
+        self,
+        n_embd,
+        n_shared_experts,
+        n_routed_experts,
+        topk,
+        expert_hidden_size,
+        dtype=None,
+    ):
+        super().__init__()
+        self.n_embd = n_embd
+        self.n_routed_experts = n_routed_experts
+        self.topk = topk
+        self.dtype = dtype
+        
+        # Parallel Setup
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        
+        # 1. Split Experts: Each GPU gets a slice of the total experts
+        assert n_routed_experts % self.world_size == 0, "Experts must divide evenly"
+        self.num_local_experts = n_routed_experts // self.world_size
+        
+        # Gate remains global (predicts for all experts)
+        self.gate = Gate(n_embd, topk, n_routed_experts, dtype=dtype)
+        
+        # Shared experts are dense, processed locally (handled by FSDP usually)
+        self.shared_experts = SharedExpert(
+            n_embd, hidden_size=n_shared_experts * expert_hidden_size, dtype=dtype
+        )
+        
+        # 2. Local Experts: Size is reduced to (Total / World_Size)
+        self.routed_fused_proj = te.GroupedLinear(
+            in_features=n_embd,
+            out_features=expert_hidden_size * 2,
+            num_gemms=self.num_local_experts,  # Local count only
+            bias=False,
+            params_dtype=dtype,
+        )
+        self.routed_down_proj = te.GroupedLinear(
+            in_features=expert_hidden_size,
+            out_features=n_embd,
+            num_gemms=self.num_local_experts, # Local count only
+            bias=False,
+            params_dtype=dtype,
+        )
+        self.last_global_counts = None
+
+    def update_bias(self, global_count, update_rate=0.001):
+        with torch.no_grad():
+            total_tokens = global_count.sum()
+            actual_load = global_count.float() / total_tokens if total_tokens != 0 else 0
+            target_load = 1 / self.n_routed_experts
+            correction = torch.sign(target_load - actual_load)
+            self.gate.bias.add_(update_rate * correction) # pyrefly: ignore
+
+    def forward(self, x):
+        B, T, C = x.shape
+        x_flat = x.view(-1, C)
+        
+        # Shared experts
+        shared = self.shared_experts(x)
+
+        # Routing (Global)
+        topk_idx, weights = self.gate(x_flat)
+        topk_idx, weights = topk_idx.to(torch.int32), weights.to(torch.bfloat16)
+
+        # Load Balancing (Global Sync)
+        if self.training:
+            tokens_per_expert = torch.bincount(topk_idx.flatten(), minlength=self.n_routed_experts)
+            if dist.is_initialized():
+                dist.all_reduce(tokens_per_expert, op=dist.ReduceOp.SUM)
+            self.update_bias(tokens_per_expert)
+            if self.rank == 0:
+                self.last_global_counts = tokens_per_expert.detach().cpu().tolist()
+
+        # 3. Dispatch Preparation
+        # Calculate which rank owns the chosen experts
+        dest_ranks = topk_idx // self.num_local_experts
+        local_expert_indices = topk_idx % self.num_local_experts
+
+        # Flatten and expand for top-k
+        x_expanded = x_flat.unsqueeze(1).expand(-1, self.topk, -1).reshape(-1, C)
+        dest_ranks_flat = dest_ranks.view(-1)
+        local_expert_idx_flat = local_expert_indices.view(-1)
+        weights_flat = weights.view(-1)
+
+        # Sort by destination rank for all_to_all
+        sort_idx = torch.argsort(dest_ranks_flat)
+        dest_ranks_sorted = dest_ranks_flat[sort_idx]
+        x_sorted = x_expanded[sort_idx]
+        local_expert_idx_sorted = local_expert_idx_flat[sort_idx]
+        weights_sorted = weights_flat[sort_idx]
+
+        # Calculate Send/Recv Counts
+        send_counts = torch.bincount(dest_ranks_sorted, minlength=self.world_size)
+        send_splits = send_counts.tolist()
+        recv_counts = torch.zeros_like(send_counts)
+        dist.all_to_all_single(recv_counts, send_counts)
+        recv_splits = recv_counts.tolist()
+
+        # 4. Dispatch (All-to-All)
+        total_recv = sum(recv_splits)
+        recv_x = torch.empty((total_recv, C), dtype=x.dtype, device=x.device)
+        recv_expert_idx = torch.empty((total_recv,), dtype=torch.int32, device=x.device)
+        recv_weights = torch.empty((total_recv,), dtype=weights.dtype, device=x.device)
+
+        dist.all_to_all_single(recv_x, x_sorted, output_split_sizes=recv_splits, input_split_sizes=send_splits)
+        dist.all_to_all_single(recv_expert_idx, local_expert_idx_sorted, output_split_sizes=recv_splits, input_split_sizes=send_splits)
+        dist.all_to_all_single(recv_weights, weights_sorted, output_split_sizes=recv_splits, input_split_sizes=send_splits)
+
+        # 5. Local Compute
+        # TE GroupedLinear requires inputs sorted by expert ID
+        recv_expert_idx = recv_expert_idx.to(torch.int32)
+        te_sort_idx = torch.argsort(recv_expert_idx)
+        recv_x_te = recv_x[te_sort_idx]
+        
+        # Prepare splits for TE
+        tokens_per_local_expert = torch.bincount(recv_expert_idx, minlength=self.num_local_experts).tolist()
+
+        # Forward Pass through Experts
+        up = self.routed_fused_proj(recv_x_te, m_splits=tokens_per_local_expert)
+        gate = up.chunk(2, dim=-1)[1]
+        up = up.chunk(2, dim=-1)[0]
+        
+        h = up * F.silu(gate)
+        out_te = self.routed_down_proj(h, m_splits=tokens_per_local_expert)
+
+        # Apply routing weights
+        out_te = out_te * recv_weights[te_sort_idx].unsqueeze(-1)
+        out_te = out_te.to(self.dtype)
+
+        # 6. Return Dispatch (All-to-All)
+        # Unsort TE order
+        inv_te_sort_idx = torch.argsort(te_sort_idx)
+        out_ready = out_te[inv_te_sort_idx]
+
+        return_x = torch.empty_like(x_sorted)
+        dist.all_to_all_single(return_x, out_ready, output_split_sizes=send_splits, input_split_sizes=recv_splits)
+
+        # 7. Un-Permute / Reduce
+        # We need to map the sorted returned tokens back to their original positions in x_flat
+        # sort_idx maps: Sorted Position -> Expanded Position
+        # We need to sum results for the same token (since topk > 1)
+        
+        output = torch.zeros(x_flat.shape, dtype=x.dtype, device=x.device)
+        
+        # Create indices mapping each returned token to its original row in x_flat
+        row_indices = torch.arange(x_flat.size(0), device=x.device).repeat_interleave(self.topk)
+        row_indices_sorted = row_indices[sort_idx]
+        
+        # Accumulate results
+        output.index_add_(0, row_indices_sorted, return_x)
+
+        return shared + output.view(B, T, C)
+
 
 # Block
 class Block(nn.Module):
@@ -348,7 +495,7 @@ class Block(nn.Module):
             dtype=dtype,
         )
         self.ln2 = te.RMSNorm(n_embd, params_dtype=dtype)
-        self.moe = MoE(
+        self.moe = ExpertParallelMoE(
             n_embd,
             n_shared_experts,
             n_routed_experts,

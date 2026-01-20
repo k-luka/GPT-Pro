@@ -81,13 +81,25 @@ def main(cfg: DictConfig):
     # Move to device BEFORE FSDP wrapping
     model.to(device_obj)
 
+    ep_ignored_modules = []
+    for block in model.transformer:
+        # We target the specific TE GroupedLinear layers inside our new ExpertParallelMoE class
+        # (Assuming you named them routed_fused_proj and routed_down_proj as in the previous code)
+        if hasattr(block.moe, "routed_fused_proj"):
+            ep_ignored_modules.append(block.moe.routed_fused_proj)
+        if hasattr(block.moe, "routed_down_proj"):
+            ep_ignored_modules.append(block.moe.routed_down_proj)
+
+    # ---------------------------------------------
+
     model = FSDP(
         model,
         auto_wrap_policy=get_auto_wrap_policy(),
+        ignored_modules=ep_ignored_modules, 
         device_id=device_obj,
         use_orig_params=True,
         mixed_precision=mp_policy,
-        sharding_strategy=ShardingStrategy.FULL_SHARD
+        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP
     )
 
     # model = torch.compile(model)

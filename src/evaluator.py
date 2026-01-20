@@ -54,10 +54,16 @@ def evaluate_hella_swag(model, device):
 
     num_correct_norm = 0
     num_total = 0
+
+    total_examples = 10042
+    cutoff = (total_examples // ddp_world_size) * ddp_world_size
     
     # Iterate over validation examples
     # We rely on iterate_examples("val") which reads the jsonl
     for i, example in enumerate(iterate_examples("val")):
+        if i >= cutoff:
+            break
+
         # Only process examples belonging to this rank
         if i % ddp_world_size != ddp_rank:
             continue

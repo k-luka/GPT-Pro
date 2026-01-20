@@ -6,3 +6,4 @@ src/te_versions/__pycache__
 data_preprocessing/__pycache__
 run.sh
 pyrefly.toml
+src/model_practice.py
