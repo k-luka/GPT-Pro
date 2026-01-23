@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import inspect
 import math
 from src.helpers import apply_rotary_emb
+from flash_attn.layers.rotary import ApplyRotaryEmb
 import torch.distributed as dist
 import transformer_engine.pytorch as te
 import json
@@ -39,8 +40,8 @@ class MLA(nn.Module):
             params_dtype=dtype,  
         )
 
-        self.q_norm = te.RMSNorm(q_latent_size, params_dtype=dtype)
-        self.kv_norm = te.RMSNorm(kv_latent_size, params_dtype=dtype)
+        self.q_norm = nn.RMSNorm(q_latent_size, dtype=dtype)
+        self.kv_norm = nn.RMSNorm(kv_latent_size, dtype=dtype)
 
         # Up-projections
         self.w_up_qr = te.Linear(
@@ -494,6 +495,7 @@ class Block(nn.Module):
             q_latent_size,
             dtype=dtype,
         )
+        self.sa = torch.compile(self.sa, mode="max-autotune") # pyrefly:ignore
         self.ln2 = te.RMSNorm(n_embd, params_dtype=dtype)
         self.moe = ExpertParallelMoE(
             n_embd,
@@ -536,9 +538,9 @@ class GPT(nn.Module):
         self.n_layers = n_layers
         self.wte = nn.Embedding(vocab_size, n_embd)
 
-        sin, cos = self._precompute_rotary_embeddings(block_size, rope_head_size)
-        self.register_buffer("sin", sin, persistent=False)
-        self.register_buffer("cos", cos, persistent=False)
+        # sin, cos = self._precompute_rotary_embeddings(block_size, rope_head_size)
+        # self.register_buffer("sin", sin, persistent=False)
+        # self.register_buffer("cos", cos, persistent=False)
         self.transformer = nn.ModuleList(
             [
                 Block(
@@ -626,8 +628,8 @@ class GPT(nn.Module):
             f"Sequence length ({T}) is longer than the block_size ({self.block_size})."
         )
         x = self.wte(idx)
-        sin = self.sin[:, :, :T, :]  # pyrefly: ignore
-        cos = self.cos[:, :, :T, :]  # pyrefly: ignore
+        # sin = self.sin[:, :, :T, :]  # pyrefly: ignore
+        # cos = self.cos[:, :, :T, :]  # pyrefly: ignore
 
         for block in self.transformer:
             x = block(x, sin, cos)

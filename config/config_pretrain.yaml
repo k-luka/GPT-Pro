@@ -4,7 +4,7 @@ hydra:
 
 experiment:
   project: "GPT_Pro"
-  run_name: "Cope_1"
+  run_name: "HTNN_1"
 
 model:
   vocab_size: 50304
@@ -19,7 +19,7 @@ model:
   
   # MoE Settings
   n_shared_experts: 2
-  n_routed_experts: 48
+  n_routed_experts: 40
   topk_experts: 8
   expert_hidden_size: 1024
 
@@ -33,9 +33,9 @@ training:
 
   # Logistics
   logging_steps: 1
-  checkpoint_interval: 1000
+  checkpoint_interval: 40000
   generation_interval: 10000000
-  eval_interval: 200
+  eval_interval: 400
   eval_steps: 40
   eval_batch_size: 8
   eval_block_size: 2048
@@ -47,3 +47,4 @@ training:
   min_lr: 2.0e-5
   weight_decay: 0.1
   
+# resume_checkpoint: output/checkpoints/Cope_1/step_6

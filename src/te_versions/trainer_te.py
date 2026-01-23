@@ -111,6 +111,7 @@ class Trainer:
         for step in range(self.config.grad_accum_steps):
             x, y = next(self.train_loader)
             x, y = x.to(self.config.device), y.to(self.config.device)
+            torch.compiler.cudagraph_mark_step_begin()
             with torch.autocast(device_type=self.config.device, dtype=torch.bfloat16):
                 with te.autocast(enabled=True, recipe=self.fp8_recipe):
                     _, loss = self.model(x, y)
@@ -302,3 +303,5 @@ class Trainer:
                 checkpoint_path
             ),
         )
+        self.step = step_tensor.item() # pyrefly:ignore
+

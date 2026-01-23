@@ -13,12 +13,12 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import torch.distributed as dist
 
-def get_auto_wrap_policy():
-    return functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={Block},
+# CHANGE: Define the policy as a concrete module-level function instead of using functools.partial.
+# This ensures it is pickleable during the distributed checkpoint planning phase.
+def fsdp_auto_wrap_policy(module, recurse, nonwrapped_numel):
+    return transformer_auto_wrap_policy(
+        module, recurse, nonwrapped_numel, transformer_layer_cls={Block}
     )
-
 
 @hydra.main(version_base=None, config_name="config_pretrain", config_path="config")
 def main(cfg: DictConfig):
@@ -83,18 +83,12 @@ def main(cfg: DictConfig):
 
     ep_ignored_modules = []
     for block in model.transformer:
-        # We target the specific TE GroupedLinear layers inside our new ExpertParallelMoE class
-        # (Assuming you named them routed_fused_proj and routed_down_proj as in the previous code)
-        if hasattr(block.moe, "routed_fused_proj"):
-            ep_ignored_modules.append(block.moe.routed_fused_proj)
-        if hasattr(block.moe, "routed_down_proj"):
-            ep_ignored_modules.append(block.moe.routed_down_proj)
+        ep_ignored_modules.append(block.moe) # pyrefly: ignore
 
-    # ---------------------------------------------
 
     model = FSDP(
         model,
-        auto_wrap_policy=get_auto_wrap_policy(),
+        auto_wrap_policy=fsdp_auto_wrap_policy,
         ignored_modules=ep_ignored_modules, 
         device_id=device_obj,
         use_orig_params=True,
