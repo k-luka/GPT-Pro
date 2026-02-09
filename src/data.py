@@ -31,6 +31,26 @@ class DataLoader:
         # Start at the offset for this specific GPU
         self.current_position = self.B * self.T * self.rank
 
+    def set_step(self, step, grad_accum_steps):
+        total_micro_steps = step * grad_accum_steps
+        bytes_to_skip = total_micro_steps * (self.B * self.T * self.world_size)
+        offset = bytes_to_skip + (self.rank * self.B * self.T)
+
+        for shard_idx, shard_path in enumerate(self.shards):
+            meta = np.load(shard_path, mmap_mode="r")
+            shard_len = meta.shape[0]
+        
+            if offset < shard_len:
+                self.current_shard = shard_idx
+                self.tokens = load_tokens(self.shards[self.current_shard])
+                self.current_position = offset
+                print(f"Rank {self.rank}: Resuming at Shard {shard_idx}, Index {self.current_position}")
+                return
+            else:
+                offset -= shard_len
+        self.reset()
+
+
     def __iter__(self):
         return self
 

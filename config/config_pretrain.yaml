@@ -4,13 +4,13 @@ hydra:
 
 experiment:
   project: "GPT_Pro"
-  run_name: "HTNN_1"
+  run_name: "LM_2"
 
 model:
   vocab_size: 50304
   block_size: 2048
   n_embd: 4096
-  n_layers: 28
+  n_layers: 27
   n_heads: 32
   head_size: 192
   rope_head_size: 64
@@ -28,23 +28,23 @@ data:
   val_data_root: "data/edu_fineweb350B/"
 
 training:
-  batch_size: 8
-  grad_accum_steps: 16
+  batch_size: 16
+  grad_accum_steps: 8
 
   # Logistics
-  logging_steps: 1
-  checkpoint_interval: 40000
+  logging_steps: 100
+  checkpoint_interval: 8000
   generation_interval: 10000000
   eval_interval: 400
-  eval_steps: 40
-  eval_batch_size: 8
+  eval_steps: 80
+  eval_batch_size: 16
   eval_block_size: 2048
   
   # Optimization
-  max_steps: 143000
+  max_steps: 160000
   warmup_steps: 2000
   max_lr: 2.0e-4
   min_lr: 2.0e-5
   weight_decay: 0.1
   
-# resume_checkpoint: output/checkpoints/Cope_1/step_6
+resume_checkpoint: output/checkpoints/LM_2/best_val

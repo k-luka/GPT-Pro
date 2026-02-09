@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import inspect
 import math
 from src.helpers import apply_rotary_emb
-from flash_attn.layers.rotary import ApplyRotaryEmb
 import torch.distributed as dist
 import transformer_engine.pytorch as te
 import json
@@ -495,7 +494,7 @@ class Block(nn.Module):
             q_latent_size,
             dtype=dtype,
         )
-        self.sa = torch.compile(self.sa, mode="max-autotune") # pyrefly:ignore
+        self.sa_compiled = torch.compile(self.sa) # pyrefly:ignore
         self.ln2 = te.RMSNorm(n_embd, params_dtype=dtype)
         self.moe = ExpertParallelMoE(
             n_embd,
@@ -507,7 +506,10 @@ class Block(nn.Module):
         )
 
     def forward(self, x, sin, cos):
-        x = x + self.sa(self.ln1(x), sin, cos)
+        if self.training:
+            x = x + self.sa_compiled(self.ln1(x), sin, cos)
+        else:
+            x = x + self.sa(self.ln1(x), sin, cos)
         x = x + self.moe(self.ln2(x))
         return x
 
@@ -538,9 +540,9 @@ class GPT(nn.Module):
         self.n_layers = n_layers
         self.wte = nn.Embedding(vocab_size, n_embd)
 
-        # sin, cos = self._precompute_rotary_embeddings(block_size, rope_head_size)
-        # self.register_buffer("sin", sin, persistent=False)
-        # self.register_buffer("cos", cos, persistent=False)
+        sin, cos = self._precompute_rotary_embeddings(block_size, rope_head_size)
+        self.register_buffer("sin", sin, persistent=False)
+        self.register_buffer("cos", cos, persistent=False)
         self.transformer = nn.ModuleList(
             [
                 Block(
@@ -628,8 +630,8 @@ class GPT(nn.Module):
             f"Sequence length ({T}) is longer than the block_size ({self.block_size})."
         )
         x = self.wte(idx)
-        # sin = self.sin[:, :, :T, :]  # pyrefly: ignore
-        # cos = self.cos[:, :, :T, :]  # pyrefly: ignore
+        sin = self.sin[:, :, :T, :]  # pyrefly: ignore
+        cos = self.cos[:, :, :T, :]  # pyrefly: ignore
 
         for block in self.transformer:
             x = block(x, sin, cos)
