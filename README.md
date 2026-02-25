@@ -2,6 +2,8 @@
 
 A research-oriented LLM codebase that started by implementing a GPT-2 Transformer from scratch and then refined with new features from papers I read until I ended up with a DeepSeek-V3 style architecture. The current model uses Multihead Latent Attention (MLA) and an auxiliary-loss-free Mixture of Experts (MoE) with shared and routed experts, plus expert parallelism.
 
+![Small-model training runs](assets/small_model_training_runs.png)
+
 This repo is built for large-scale training on multi-GPU clusters and includes data preprocessing, evaluation, logging, and distributed training utilities.
 
 ## Highlights
@@ -37,6 +39,8 @@ The model is a decoder-only Transformer with:
 - Largest trained model: **~15B total params, ~4B active params**.
 - Training hardware: **NVIDIA B200 (Blackwell)** with FP8 (Transformer Engine) on HiPerGator.
 - Parallelism: **Data Parallelism + Expert Parallelism + Optimizer Sharding**.
+
+The chart above summarizes iterative feature additions on the 350M-scale model; MoE was then added on the large model.
 
 ## Quickstart
 ### 1) Prepare data
