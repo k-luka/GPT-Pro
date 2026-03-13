@@ -1,0 +1,7 @@
+hydra:
+  run:
+    dir: output/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+convert:
+  input_checkpoint_dir: "output/checkpoints/LM_2/best_val"
+  output_pt_file: "output/checkpoints/LM_2/best_val_single.pt"

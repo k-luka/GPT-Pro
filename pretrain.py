@@ -13,8 +13,7 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import torch.distributed as dist
 
-# CHANGE: Define the policy as a concrete module-level function instead of using functools.partial.
-# This ensures it is pickleable during the distributed checkpoint planning phase.
+# fsdp policy
 def fsdp_auto_wrap_policy(module, recurse, nonwrapped_numel):
     return transformer_auto_wrap_policy(
         module, recurse, nonwrapped_numel, transformer_layer_cls={Block}

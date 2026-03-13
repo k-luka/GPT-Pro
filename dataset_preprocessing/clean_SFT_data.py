@@ -17,7 +17,7 @@ def preprocess():
     os.makedirs(os.path.dirname(TRAIN_FILE), exist_ok=True)
     
     enc = tiktoken.get_encoding('gpt2')
-    eot_token = enc._special_tokens['<|endoftext|>']
+    eot_token = enc.eot_token
     dataset = load_dataset(DATASET_NAME, split="train")
 
     processed_data = []
@@ -29,15 +29,18 @@ def preprocess():
     for item in tqdm(dataset):
         instruction = item.get('instruction') # pyrefly: ignore
         response = item.get('output') # pyrefly: ignore
+
+        if not instruction or not response:
+            continue
         
-        # 1. Format & Tokenize Prompt
+        # We prepend EOS as a BOS/start token, which also acts as an attention sink.
         prompt_text = f"{user_header}{instruction}{assist_header}"
         prompt_tokens = [eot_token] + enc.encode_ordinary(prompt_text)
         
-        # 2. Format & Tokenize Response
+        # Format & Tokenize Response
         response_tokens = enc.encode_ordinary(response) + [eot_token]
         
-        # 3. Combine
+        # Combine
         full_tokens = prompt_tokens + response_tokens
         
         if len(full_tokens) <= MAX_LENGTH:
@@ -47,7 +50,7 @@ def preprocess():
                 "mask_len": mask_len
             })
 
-    # --- THE NEW PART: SPLITTING ---
+    # SPLITTING
     print(f"\nTotal examples: {len(processed_data)}")
     print("Shuffling and splitting...")
     
@@ -71,6 +74,7 @@ def inspect_file(file_path, num_samples=3):
     print(f"\n--- INSPECTING: {file_path} ---")
     data = torch.load(file_path)
     enc = tiktoken.get_encoding('gpt2')
+    num_samples = min(num_samples, len(data))
     
     for i in range(num_samples):
         item = data[i]
@@ -99,7 +103,7 @@ def inspect_file(file_path, num_samples=3):
 
 # Add this to your main block
 if __name__ == "__main__":
-    # preprocess() # Comment this out if you already generated the files
-    
-    # Run inspection
-    inspect_file("data/sft_data/sft_train.pt")
+    if not os.path.exists(TRAIN_FILE) or not os.path.exists(VAL_FILE):
+        preprocess()
+
+    inspect_file(TRAIN_FILE)

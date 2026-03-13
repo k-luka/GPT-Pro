@@ -1,0 +1,28 @@
+hydra:
+  run:
+    dir: output/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+inference:
+  device: "cuda"
+  checkpoint: "output/checkpoints/LM_2/best_val"
+  prompt: "User: Hello\nAssistant: "
+  max_new_tokens: 200
+  topk: 50
+  num_sequences: 1
+
+model:
+  vocab_size: 50304
+  block_size: 2048
+  n_embd: 4096
+  n_layers: 27
+  n_heads: 32
+  head_size: 192
+  rope_head_size: 64
+  kv_latent_size: 512
+  q_latent_size: 4096
+
+  # Must match checkpoint architecture
+  n_shared_experts: 2
+  n_routed_experts: 40
+  topk_experts: 8
+  expert_hidden_size: 1024
