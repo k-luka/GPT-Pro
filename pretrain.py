@@ -88,7 +88,7 @@ def main(cfg: DictConfig):
     model = FSDP(
         model,
         auto_wrap_policy=fsdp_auto_wrap_policy,
-        ignored_modules=ep_ignored_modules, 
+        ignored_modules=ep_ignored_modules, # pyrefly: ignore
         device_id=device_obj,
         use_orig_params=True,
         mixed_precision=mp_policy,

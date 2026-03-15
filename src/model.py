@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import inspect
 import math
-from src.helpers import apply_rotary_emb, norm
+from src.helpers import apply_rotary_emb
 import torch.distributed as dist
 
 
@@ -85,6 +85,8 @@ class Attention(nn.Module):
         self.H = n_embd // n_heads # head size
         self.attn = nn.Linear(n_embd, 3 * n_embd)
         self.proj = nn.Linear(n_embd, n_embd)
+        self.q_norm = nn.RMSNorm(self.H)
+        self.k_norm = nn.RMSNorm(self.H)
         self.proj.RESIDUAL_SCALE_INIT_FACTOR = True # pyrefly: ignore
         # self.register_buffer("tril", torch.tril(torch.ones(block_size,block_size)).view(1,1,block_size,block_size))
 
@@ -97,7 +99,7 @@ class Attention(nn.Module):
         # Apply RoPE
         q = apply_rotary_emb(q, sin, cos)
         k = apply_rotary_emb(k, sin, cos)
-        q, k = norm(q), norm(k)
+        q, k = self.q_norm(q), self.k_norm(k)
         # att = q @ k.tranpose(-2,-1) / (1 * math.sqrt(self.H)) # (B,n_heads,T,T)
         # att = att.masked_fill(self.tril[:,:,:T,:T], float("-inf"))
         # out = att @ v # (B,n_heds,T,H)

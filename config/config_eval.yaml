@@ -2,13 +2,9 @@ hydra:
   run:
     dir: output/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
-inference:
+eval:
   device: "cuda"
   checkpoint: "output/checkpoints/SFT_retry_1/best.pt"
-  prompt: ""
-  max_new_tokens: 200
-  topk: 50
-  num_sequences: 1
 
 model:
   vocab_size: 50304

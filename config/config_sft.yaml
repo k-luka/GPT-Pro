@@ -28,8 +28,8 @@ data:
   val_file: "data/sft_data/sft_val.pt"
 
 training:
-  batch_size: 4
-  grad_accum_steps: 4
+  batch_size: 8
+  grad_accum_steps: 2
   max_steps: 5000
   warmup_steps: 100
   max_lr: 5.0e-5
@@ -40,10 +40,11 @@ training:
   # Logging and evaluation cadence
   logging_steps: 10
   eval_interval: 100
+  
   eval_steps: 20
   eval_batch_size: 4
   checkpoint_interval: 500
 
   device: "cuda"
 
-resume_checkpoint: "output/checkpoints/LM_2/best_val"
+resume_checkpoint: "output/checkpoints/LM_2/best_val_single.pt"

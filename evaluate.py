@@ -1,13 +1,12 @@
 import os
-
 import hydra
-import tiktoken
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from omegaconf import DictConfig, OmegaConf
 
 from src.te_versions.model_te import GPT
+from src.evaluator import evaluate_hella_swag
 
 
 def maybe_init_dist(device: str):
@@ -83,48 +82,21 @@ def load_checkpoint_any_format(model, checkpoint_path: str, device: torch.device
     raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
 
 
-def build_prompt_text(raw_prompt: str):
-    if "Assistant:" not in raw_prompt:
-        raw_prompt = raw_prompt.rstrip() + "\nAssistant: "
-    return raw_prompt
-
-
-def encode_prompt(prompt_text: str, device: torch.device):
-    enc = tiktoken.get_encoding("gpt2")
-    tokens = [enc.eot_token] + enc.encode_ordinary(prompt_text)
-    idx = torch.tensor(tokens, dtype=torch.long, device=device)
-    return enc, idx
-
-
-@torch.no_grad()
-def run_generation(model, idx, num_sequences: int, max_new_tokens: int, topk: int):
-    return model.generate(
-        idx,
-        num_sequences=num_sequences,
-        max_tokens=max_new_tokens,
-        topk=topk,
-        chat_mode=True,
-        eos_token=50256,
-    )
-
-
-def decode_and_print(enc, out_tokens):
-    for i in range(out_tokens.size(0)):
-        text = enc.decode(out_tokens[i].tolist())
-        print(f"\n=== Sample {i} ===\n{text}\n")
-
-
 def cleanup_dist():
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
-@hydra.main(version_base=None, config_name="config_inference", config_path="../config")
+@hydra.main(version_base=None, config_name="config_eval", config_path="config")
 def main(cfg: DictConfig):
+    print("=" * 40)
+    print("Evaluation Configuration")
     print(OmegaConf.to_yaml(cfg))
+    print("=" * 40)
 
-    device = torch.device(cfg.inference.device)
+    device = torch.device(cfg.eval.device)
 
+    # Setup optimizations
     torch.set_float32_matmul_precision("high")
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -132,41 +104,17 @@ def main(cfg: DictConfig):
 
     maybe_init_dist(device.type)
 
+    print(f"Building model...")
     model = build_model(cfg, device).eval()
-    load_checkpoint_any_format(model, cfg.inference.checkpoint, device)
 
-    conversation_history = ""
+    print(f"Loading checkpoint from: {cfg.eval.checkpoint}")
+    load_checkpoint_any_format(model, cfg.eval.checkpoint, device)
 
-    while True:
-        try:
-            user_input = input("User: ")
-        except (KeyboardInterrupt, EOFError):
-            break
-        
-        if user_input.strip().lower() in ["exit", "quit"]:
-            break
+    print("Evaluating on HellaSwag...")
+    # Evaluate HellaSwag using evaluator
+    acc = evaluate_hella_swag(model, device)
 
-        conversation_history += f"User: {user_input}\nAssistant: "
-
-        enc, idx = encode_prompt(conversation_history, device)
-
-        with torch.inference_mode():
-            out_tokens = run_generation(
-                model,
-                idx,
-                num_sequences=1,
-                max_new_tokens=cfg.inference.max_new_tokens,
-                topk=cfg.inference.topk,
-            )
-
-        # Extract the new generated stuff
-        input_len = idx.size(0)
-        new_tokens = out_tokens[0, input_len:]
-
-        reply_text = enc.decode(new_tokens.tolist()).strip()
-        print(f"Assistant: {reply_text}\n")
-
-        conversation_history += f"{reply_text}\n"
+    print(f"\n---> HellaSwag Accuracy: {acc * 100:.2f}%\n")
 
     cleanup_dist()
 

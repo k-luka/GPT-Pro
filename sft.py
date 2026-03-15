@@ -15,14 +15,6 @@ from omegaconf import DictConfig, OmegaConf
 from src.te_versions.model_te import GPT
 
 
-def init_single_process_dist(device: str) -> None:
-	if dist.is_initialized():
-		return
-	backend = "nccl" if device == "cuda" else "gloo"
-	store = dist.HashStore()
-	dist.init_process_group(backend=backend, store=store, rank=0, world_size=1)
-
-
 def load_sft_data(file_path: str):
 	return torch.load(file_path, map_location="cpu")
 
@@ -78,17 +70,29 @@ def get_lr(step: int, warmup_steps: int, max_steps: int, max_lr: float, min_lr: 
 
 def load_pretrained_checkpoint(model, optimizer, checkpoint_path: str, device: torch.device):
 	if os.path.isdir(checkpoint_path) and os.path.exists(os.path.join(checkpoint_path, ".metadata")):
-		state = {"model": model}
-		dcp.load(
-			state_dict=state,
-			storage_reader=dcp.FileSystemReader(checkpoint_path),
-		)
-		print(f"Loaded model weights from DCP checkpoint: {checkpoint_path}")
-		return 0, float("inf")
+		try:
+			state = {"model": model.state_dict()}
+			dcp.load(
+				state_dict=state,
+				storage_reader=dcp.FileSystemReader(checkpoint_path),
+				no_dist=True,
+			)
+			model.load_state_dict(state["model"], strict=False)
+			print(f"Loaded model weights from DCP checkpoint: {checkpoint_path}")
+			return 0, float("inf")
+		except Exception as exc:
+			fallback_pt = f"{checkpoint_path}_single.pt"
+			if os.path.exists(fallback_pt):
+				print(
+					f"DCP load failed ({exc}). Falling back to converted checkpoint: {fallback_pt}"
+				)
+				checkpoint_path = fallback_pt
+			else:
+				raise
 
 	checkpoint = torch.load(checkpoint_path, map_location=device)
 	if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-		model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+		model.load_state_dict(checkpoint["model_state_dict"], strict=False)
 		if "optimizer_state_dict" in checkpoint:
 			optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 		step = int(checkpoint.get("step", 0))
@@ -96,8 +100,17 @@ def load_pretrained_checkpoint(model, optimizer, checkpoint_path: str, device: t
 		print(f"Loaded training checkpoint: {checkpoint_path}")
 		return step, best_val
 
+	if isinstance(checkpoint, dict) and "model" in checkpoint:
+		model_payload = checkpoint["model"]
+		if isinstance(model_payload, dict) and "model_state_dict" in model_payload:
+			model_payload = model_payload["model_state_dict"]
+		if isinstance(model_payload, dict):
+			model.load_state_dict(model_payload, strict=False)
+			print(f"Loaded converted checkpoint (model key): {checkpoint_path}")
+			return 0, float("inf")
+
 	if isinstance(checkpoint, dict):
-		model.load_state_dict(checkpoint, strict=True)
+		model.load_state_dict(checkpoint, strict=False)
 		print(f"Loaded state_dict checkpoint: {checkpoint_path}")
 		return 0, float("inf")
 
@@ -146,15 +159,18 @@ def evaluate(model, val_data, cfg: DictConfig, device: torch.device):
 
 @hydra.main(version_base=None, config_name="config_sft", config_path="config")
 def main(cfg: DictConfig):
-	device = torch.device(cfg.training.device)
+	dist.init_process_group("nccl")
+	rank = dist.get_rank()
+	local_rank = int(os.environ["LOCAL_RANK"])
+	torch.cuda.set_device(local_rank)
+	device = torch.device(f"cuda:{local_rank}")
+	master_rank = rank == 0
 
-	init_single_process_dist(device.type)
-
-	print(OmegaConf.to_yaml(cfg))
+	if master_rank:
+		print(OmegaConf.to_yaml(cfg))
 	torch.set_float32_matmul_precision("high")
-	if device.type == "cuda":
-		torch.backends.cuda.matmul.allow_tf32 = True
-		torch.backends.cudnn.allow_tf32 = True
+	torch.backends.cuda.matmul.allow_tf32 = True
+	torch.backends.cudnn.allow_tf32 = True
 
 	model = GPT(
 		n_embd=cfg.model.n_embd,
@@ -185,17 +201,19 @@ def main(cfg: DictConfig):
 
 	train_data = load_sft_data(cfg.data.train_file)
 	val_data = load_sft_data(cfg.data.val_file)
-	wandb_config = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
-
-	wandb_run = wandb.init(
-		project=cfg.experiment.project,
-		name=cfg.experiment.run_name,
-		config=wandb_config,
-		dir=os.getcwd(),
-	)
+	wandb_run = None
+	if master_rank:
+		wandb_config = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
+		wandb_run = wandb.init(
+			project=cfg.experiment.project,
+			name=cfg.experiment.run_name,
+			config=wandb_config,
+			dir=os.getcwd(),
+		)
 
 	model.train()
-	print(f"Starting SFT from step {start_step + 1} to {cfg.training.max_steps}")
+	if master_rank:
+		print(f"Starting SFT from step {start_step + 1} to {cfg.training.max_steps}")
 
 	for step in range(start_step + 1, cfg.training.max_steps + 1):
 		t0 = time.time()
@@ -240,34 +258,38 @@ def main(cfg: DictConfig):
 				* cfg.training.grad_accum_steps
 				/ max(dt, 1e-6)
 			)
-			print(
-				f"step {step:6d} | train_loss {train_loss:.6f} | lr {lr:.3e} | "
-				f"dt {dt*1000:.1f} ms | tokens/sec {tps:.1f}"
-			)
+			if master_rank:
+				print(
+					f"step {step:6d} | train_loss {train_loss:.6f} | lr {lr:.3e} | "
+					f"dt {dt*1000:.1f} ms | tokens/sec {tps:.1f}"
+				)
 
-		wandb_run.log(
-			{
-				"train/loss": train_loss,
-				"train/lr": lr,
-				"train/step_time_ms": dt * 1000,
-			},
-			step=step,
-		)
+		if master_rank and wandb_run is not None:
+			wandb_run.log(
+				{
+					"train/loss": train_loss,
+					"train/lr": lr,
+					"train/step_time_ms": dt * 1000,
+				},
+				step=step,
+			)
 
 		if step % cfg.training.eval_interval == 0:
 			val_loss = evaluate(model, val_data, cfg, device)
 			is_best = val_loss < best_val_loss
 			if is_best:
 				best_val_loss = val_loss
-			print(f"step {step:6d} | val_loss {val_loss:.6f} | best {best_val_loss:.6f}")
+			if master_rank:
+				print(f"step {step:6d} | val_loss {val_loss:.6f} | best {best_val_loss:.6f}")
 
-			wandb_run.log(
-				{
-					"val/loss": val_loss,
-					"val/best_loss": best_val_loss,
-				},
-				step=step,
-			)
+			if master_rank and wandb_run is not None:
+				wandb_run.log(
+					{
+						"val/loss": val_loss,
+						"val/best_loss": best_val_loss,
+					},
+					step=step,
+				)
 
 			save_sft_checkpoint(
 				model=model,
@@ -287,10 +309,10 @@ def main(cfg: DictConfig):
 				is_best=False,
 			)
 
-	wandb_run.finish()
+	if master_rank and wandb_run is not None:
+		wandb_run.finish()
 
-	if dist.is_initialized():
-		dist.destroy_process_group()
+	dist.destroy_process_group()
 
 
 if __name__ == "__main__":
