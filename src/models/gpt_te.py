@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import inspect
 import math
-from src.helpers import apply_rotary_emb
+from src.utils.helpers import apply_rotary_emb
 import torch.distributed as dist
 import transformer_engine.pytorch as te
 import json
@@ -36,7 +36,7 @@ class MLA(nn.Module):
             n_embd,
             q_latent_size + kv_latent_size + rope_head_size,
             bias=False,
-            params_dtype=dtype,  
+            params_dtype=dtype,
         )
 
         self.q_norm = nn.RMSNorm(q_latent_size, dtype=dtype)
@@ -110,9 +110,9 @@ class MLA(nn.Module):
 class Attention(nn.Module):
     def __init__(self, n_embd, n_heads, dtype=None):
         super().__init__()
-        assert n_embd % n_heads == 0, (
-            f"Embedding dim ({n_embd}) must be divisible by number of heads ({n_heads})."
-        )
+        assert (
+            n_embd % n_heads == 0
+        ), f"Embedding dim ({n_embd}) must be divisible by number of heads ({n_heads})."
         self.n_embd = n_embd
         self.n_heads = n_heads
         self.H = n_embd // n_heads  # head size
@@ -259,7 +259,9 @@ class MoE(nn.Module):
         """
         with torch.no_grad():
             total_tokens = global_count.sum()
-            actual_load = global_count.float() / total_tokens if total_tokens != 0 else 0
+            actual_load = (
+                global_count.float() / total_tokens if total_tokens != 0 else 0
+            )
             target_load = 1 / self.n_routed_experts
 
             # Determine correction direction
@@ -309,6 +311,7 @@ class MoE(nn.Module):
         )
         return shared + routed.view(B, T, C)
 
+
 class ExpertParallelMoE(nn.Module):
     def __init__(
         self,
@@ -324,23 +327,23 @@ class ExpertParallelMoE(nn.Module):
         self.n_routed_experts = n_routed_experts
         self.topk = topk
         self.dtype = dtype
-        
+
         # Parallel Setup
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.rank = dist.get_rank() if dist.is_initialized() else 0
-        
+
         # 1. Split Experts: Each GPU gets a slice of the total experts
         assert n_routed_experts % self.world_size == 0, "Experts must divide evenly"
         self.num_local_experts = n_routed_experts // self.world_size
-        
+
         # Gate remains global (predicts for all experts)
         self.gate = Gate(n_embd, topk, n_routed_experts, dtype=dtype)
-        
+
         # Shared experts are dense, processed locally (handled by FSDP usually)
         self.shared_experts = SharedExpert(
             n_embd, hidden_size=n_shared_experts * expert_hidden_size, dtype=dtype
         )
-        
+
         # 2. Local Experts: Size is reduced to (Total / World_Size)
         self.routed_fused_proj = te.GroupedLinear(
             in_features=n_embd,
@@ -352,7 +355,7 @@ class ExpertParallelMoE(nn.Module):
         self.routed_down_proj = te.GroupedLinear(
             in_features=expert_hidden_size,
             out_features=n_embd,
-            num_gemms=self.num_local_experts, # Local count only
+            num_gemms=self.num_local_experts,  # Local count only
             bias=False,
             params_dtype=dtype,
         )
@@ -361,15 +364,17 @@ class ExpertParallelMoE(nn.Module):
     def update_bias(self, global_count, update_rate=0.001):
         with torch.no_grad():
             total_tokens = global_count.sum()
-            actual_load = global_count.float() / total_tokens if total_tokens != 0 else 0
+            actual_load = (
+                global_count.float() / total_tokens if total_tokens != 0 else 0
+            )
             target_load = 1 / self.n_routed_experts
             correction = torch.sign(target_load - actual_load)
-            self.gate.bias.add_(update_rate * correction) # pyrefly: ignore
+            self.gate.bias.add_(update_rate * correction)  # pyrefly: ignore
 
     def forward(self, x):
         B, T, C = x.shape
         x_flat = x.view(-1, C)
-        
+
         # Shared experts
         shared = self.shared_experts(x)
 
@@ -379,7 +384,9 @@ class ExpertParallelMoE(nn.Module):
 
         # Load Balancing (Global Sync)
         if self.training:
-            tokens_per_expert = torch.bincount(topk_idx.flatten(), minlength=self.n_routed_experts)
+            tokens_per_expert = torch.bincount(
+                topk_idx.flatten(), minlength=self.n_routed_experts
+            )
             if dist.is_initialized():
                 dist.all_reduce(tokens_per_expert, op=dist.ReduceOp.SUM)
             self.update_bias(tokens_per_expert)
@@ -417,24 +424,41 @@ class ExpertParallelMoE(nn.Module):
         recv_expert_idx = torch.empty((total_recv,), dtype=torch.int32, device=x.device)
         recv_weights = torch.empty((total_recv,), dtype=weights.dtype, device=x.device)
 
-        dist.all_to_all_single(recv_x, x_sorted, output_split_sizes=recv_splits, input_split_sizes=send_splits)
-        dist.all_to_all_single(recv_expert_idx, local_expert_idx_sorted, output_split_sizes=recv_splits, input_split_sizes=send_splits)
-        dist.all_to_all_single(recv_weights, weights_sorted, output_split_sizes=recv_splits, input_split_sizes=send_splits)
+        dist.all_to_all_single(
+            recv_x,
+            x_sorted,
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+        )
+        dist.all_to_all_single(
+            recv_expert_idx,
+            local_expert_idx_sorted,
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+        )
+        dist.all_to_all_single(
+            recv_weights,
+            weights_sorted,
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+        )
 
         # 5. Local Compute
         # TE GroupedLinear requires inputs sorted by expert ID
         recv_expert_idx = recv_expert_idx.to(torch.int32)
         te_sort_idx = torch.argsort(recv_expert_idx)
         recv_x_te = recv_x[te_sort_idx]
-        
+
         # Prepare splits for TE
-        tokens_per_local_expert = torch.bincount(recv_expert_idx, minlength=self.num_local_experts).tolist()
+        tokens_per_local_expert = torch.bincount(
+            recv_expert_idx, minlength=self.num_local_experts
+        ).tolist()
 
         # Forward Pass through Experts
         up = self.routed_fused_proj(recv_x_te, m_splits=tokens_per_local_expert)
         gate = up.chunk(2, dim=-1)[1]
         up = up.chunk(2, dim=-1)[0]
-        
+
         h = up * F.silu(gate)
         out_te = self.routed_down_proj(h, m_splits=tokens_per_local_expert)
 
@@ -448,19 +472,26 @@ class ExpertParallelMoE(nn.Module):
         out_ready = out_te[inv_te_sort_idx]
 
         return_x = torch.empty_like(x_sorted)
-        dist.all_to_all_single(return_x, out_ready, output_split_sizes=send_splits, input_split_sizes=recv_splits)
+        dist.all_to_all_single(
+            return_x,
+            out_ready,
+            output_split_sizes=send_splits,
+            input_split_sizes=recv_splits,
+        )
 
         # 7. Un-Permute / Reduce
         # We need to map the sorted returned tokens back to their original positions in x_flat
         # sort_idx maps: Sorted Position -> Expanded Position
         # We need to sum results for the same token (since topk > 1)
-        
+
         output = torch.zeros(x_flat.shape, dtype=x.dtype, device=x.device)
-        
+
         # Create indices mapping each returned token to its original row in x_flat
-        row_indices = torch.arange(x_flat.size(0), device=x.device).repeat_interleave(self.topk)
+        row_indices = torch.arange(x_flat.size(0), device=x.device).repeat_interleave(
+            self.topk
+        )
         row_indices_sorted = row_indices[sort_idx]
-        
+
         # Accumulate results
         output.index_add_(0, row_indices_sorted, return_x)
 
@@ -494,7 +525,7 @@ class Block(nn.Module):
             q_latent_size,
             dtype=dtype,
         )
-        self.sa_compiled = torch.compile(self.sa) # pyrefly:ignore
+        self.sa_compiled = torch.compile(self.sa)  # pyrefly:ignore
         self.ln2 = te.RMSNorm(n_embd, params_dtype=dtype)
         self.moe = ExpertParallelMoE(
             n_embd,
@@ -606,7 +637,9 @@ class GPT(nn.Module):
 
             # These modules all have a standard .weight attribute
             if hasattr(module, "weight"):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=std)  # pyrefly: ignore
+                torch.nn.init.normal_(
+                    module.weight, mean=0.0, std=std # pyrefly: ignore
+                ) 
 
             if hasattr(module, "bias") and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)  # pyrefly: ignore
@@ -615,10 +648,14 @@ class GPT(nn.Module):
         elif isinstance(module, te.GroupedLinear):
             if hasattr(module, "weight"):
                 # Just in case future versions use 'weight'
-                torch.nn.init.normal_(module.weight, mean=0.0, std=std)  # pyrefly: ignore
+                torch.nn.init.normal_(
+                    module.weight, mean=0.0, std=std # pyrefly: ignore
+                )  
             elif hasattr(module, "weight0"):
                 # THIS IS THE FIX: Initialize weight0
-                torch.nn.init.normal_(module.weight0, mean=0.0, std=std)  # pyrefly: ignore
+                torch.nn.init.normal_(
+                    module.weight0, mean=0.0, std=std # pyrefly: ignore
+                )  
 
             # It usually doesn't have bias in MoE, but safe
             if hasattr(module, "bias") and module.bias is not None:
@@ -626,9 +663,9 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        assert T <= self.block_size, (
-            f"Sequence length ({T}) is longer than the block_size ({self.block_size})."
-        )
+        assert (
+            T <= self.block_size
+        ), f"Sequence length ({T}) is longer than the block_size ({self.block_size})."
         x = self.wte(idx)
         sin = self.sin[:, :, :T, :]  # pyrefly: ignore
         cos = self.cos[:, :, :T, :]  # pyrefly: ignore

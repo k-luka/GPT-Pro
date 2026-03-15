@@ -1,7 +1,7 @@
 import torch
-from src.te_versions.model_te import GPT, Block
-from src.te_versions.trainer_te import Trainer, TrainerConfig
-from src.helpers import print_trainable_parameters, estimate_flops
+from src.models.gpt_te import GPT, Block
+from src.training.trainer_te import Trainer, TrainerConfig
+from src.utils.helpers import print_trainable_parameters, estimate_flops
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from typing import Any, cast
@@ -13,11 +13,13 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import torch.distributed as dist
 
+
 # fsdp policy
 def fsdp_auto_wrap_policy(module, recurse, nonwrapped_numel):
     return transformer_auto_wrap_policy(
         module, recurse, nonwrapped_numel, transformer_layer_cls={Block}
     )
+
 
 @hydra.main(version_base=None, config_name="config_pretrain", config_path="config")
 def main(cfg: DictConfig):
@@ -39,17 +41,18 @@ def main(cfg: DictConfig):
     if master_rank:
         wandb_run = wandb.init(
             project=cfg.experiment.project,
-            name=cfg.experiment.run_name, 
+            name=cfg.experiment.run_name,
             config=cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True)),
-            dir=os.getcwd() 
+            dir=os.getcwd(),
         )
 
     # define tokenizer
     import tiktoken
-    enc = tiktoken.encoding_for_model('gpt2')
+
+    enc = tiktoken.encoding_for_model("gpt2")
 
     # speed up
-    torch.set_float32_matmul_precision('high')
+    torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -61,38 +64,37 @@ def main(cfg: DictConfig):
 
     # Define model
     model = GPT(
-        n_embd = cfg.model.n_embd,
-        vocab_size = cfg.model.vocab_size,
-        block_size = cfg.model.block_size,
-        n_heads = cfg.model.n_heads,
-        head_size = cfg.model.head_size,
-        rope_head_size = cfg.model.rope_head_size,
-        kv_latent_size = cfg.model.kv_latent_size,
-        q_latent_size = cfg.model.q_latent_size,
-        n_layers = cfg.model.n_layers,
-        n_shared_experts = cfg.model.n_shared_experts,
-        n_routed_experts = cfg.model.n_routed_experts,
-        topk_experts = cfg.model.topk_experts,
-        expert_hidden_size = cfg.model.expert_hidden_size,
-        dtype = torch.bfloat16
+        n_embd=cfg.model.n_embd,
+        vocab_size=cfg.model.vocab_size,
+        block_size=cfg.model.block_size,
+        n_heads=cfg.model.n_heads,
+        head_size=cfg.model.head_size,
+        rope_head_size=cfg.model.rope_head_size,
+        kv_latent_size=cfg.model.kv_latent_size,
+        q_latent_size=cfg.model.q_latent_size,
+        n_layers=cfg.model.n_layers,
+        n_shared_experts=cfg.model.n_shared_experts,
+        n_routed_experts=cfg.model.n_routed_experts,
+        topk_experts=cfg.model.topk_experts,
+        expert_hidden_size=cfg.model.expert_hidden_size,
+        dtype=torch.bfloat16,
     )
-    
+
     # Move to device BEFORE FSDP wrapping
     model.to(device_obj)
 
     ep_ignored_modules = []
     for block in model.transformer:
-        ep_ignored_modules.append(block.moe) # pyrefly: ignore
-
+        ep_ignored_modules.append(block.moe)  # pyrefly: ignore
 
     model = FSDP(
         model,
         auto_wrap_policy=fsdp_auto_wrap_policy,
-        ignored_modules=ep_ignored_modules, # pyrefly: ignore
+        ignored_modules=ep_ignored_modules,  # pyrefly: ignore
         device_id=device_obj,
         use_orig_params=True,
         mixed_precision=mp_policy,
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP
+        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
     )
 
     # model = torch.compile(model)
@@ -128,7 +130,7 @@ def main(cfg: DictConfig):
     )
 
     if master_rank:
-        print_trainable_parameters(cfg, model) 
+        print_trainable_parameters(cfg, model)
         estimate_flops(cfg)
 
     # check if training from checkpoint
@@ -139,8 +141,9 @@ def main(cfg: DictConfig):
 
     if master_rank:
         wandb.finish()
-    
+
     dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     main()

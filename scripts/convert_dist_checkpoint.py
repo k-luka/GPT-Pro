@@ -19,16 +19,22 @@ def _call_dcp_to_torch_save(func, src_dir: str, dst_file: str):
         lname = name.lower()
         if "dcp" in lname or "checkpoint" in lname or "source" in lname:
             kwargs[name] = src_dir
-        elif "torch" in lname or "save" in lname or "output" in lname or "dest" in lname:
+        elif (
+            "torch" in lname or "save" in lname or "output" in lname or "dest" in lname
+        ):
             kwargs[name] = dst_file
 
     if not kwargs:
-        raise RuntimeError("Could not infer dcp_to_torch_save signature for this torch version")
+        raise RuntimeError(
+            "Could not infer dcp_to_torch_save signature for this torch version"
+        )
 
     return func(**kwargs)
 
 
-@hydra.main(version_base=None, config_name="config_convert_checkpoint", config_path="config")
+@hydra.main(
+    version_base=None, config_name="config_convert_checkpoint", config_path="config"
+)
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
 
@@ -38,7 +44,9 @@ def main(cfg: DictConfig):
     if not os.path.isdir(src_dir):
         raise FileNotFoundError(f"Input checkpoint dir not found: {src_dir}")
     if not os.path.exists(os.path.join(src_dir, ".metadata")):
-        raise FileNotFoundError(f"Input checkpoint dir does not look like DCP (missing .metadata): {src_dir}")
+        raise FileNotFoundError(
+            f"Input checkpoint dir does not look like DCP (missing .metadata): {src_dir}"
+        )
 
     out_dir = os.path.dirname(dst_file)
     if out_dir:

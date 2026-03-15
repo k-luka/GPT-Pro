@@ -2,11 +2,13 @@ import os
 import torch
 import numpy as np
 
+
 def load_tokens(filename):
     npt = np.load(filename)
     npt = npt.astype(np.int32)
     ptt = torch.tensor(npt, dtype=torch.long)
     return ptt
+
 
 class DataLoader:
     def __init__(self, data_root, batch_size, block_size, split, rank=0, world_size=1):
@@ -39,37 +41,38 @@ class DataLoader:
         for shard_idx, shard_path in enumerate(self.shards):
             meta = np.load(shard_path, mmap_mode="r")
             shard_len = meta.shape[0]
-        
+
             if offset < shard_len:
                 self.current_shard = shard_idx
                 self.tokens = load_tokens(self.shards[self.current_shard])
                 self.current_position = offset
-                print(f"Rank {self.rank}: Resuming at Shard {shard_idx}, Index {self.current_position}")
+                print(
+                    f"Rank {self.rank}: Resuming at Shard {shard_idx}, Index {self.current_position}"
+                )
                 return
             else:
                 offset -= shard_len
         self.reset()
-
 
     def __iter__(self):
         return self
 
     def __next__(self):
         B, T = self.B, self.T
-        
+
         # Check if we need to switch shards
-        if self.current_position + (B*T + 1) > len(self.tokens):
+        if self.current_position + (B * T + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
             # Reset position: Rank 0 starts at 0, Rank 1 at B*T, etc.
             self.current_position = B * T * self.rank
 
-        buff = self.tokens[self.current_position : self.current_position + B*T + 1]
+        buff = self.tokens[self.current_position : self.current_position + B * T + 1]
 
         x = buff[:-1].view(B, T)
         y = buff[1:].view(B, T)
-        
+
         # Advance position by total batch size across all GPUs
         self.current_position += B * T * self.world_size
-        
+
         return x, y

@@ -5,8 +5,8 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from omegaconf import DictConfig, OmegaConf
 
-from src.te_versions.model_te import GPT
-from src.evaluator import evaluate_hella_swag
+from src.models.gpt_te import GPT
+from src.eval.metrics import evaluate_hella_swag
 
 
 def maybe_init_dist(device: str):
@@ -44,7 +44,9 @@ def _load_state(model, state_dict: dict):
 
 
 def load_checkpoint_any_format(model, checkpoint_path: str, device: torch.device):
-    if os.path.isdir(checkpoint_path) and os.path.exists(os.path.join(checkpoint_path, ".metadata")):
+    if os.path.isdir(checkpoint_path) and os.path.exists(
+        os.path.join(checkpoint_path, ".metadata")
+    ):
         # Load raw tensors first, then apply to module. This avoids pickling
         # issues with compiled/module code objects during DCP planning.
         state = {"model": model.state_dict()}

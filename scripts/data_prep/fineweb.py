@@ -13,31 +13,37 @@ from tqdm import tqdm
 # -------------------
 local_dir = "edu_fineweb350B"
 remote_name = "sample-350BT"
-shard_size = int(1e8) # 100M tokens per shard, total of 100 shards
+shard_size = int(1e8)  # 100M tokens per shard, total of 100 shards
 
 # create cache local dir
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "data", local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
 # download the dataset
-fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train", streaming=True)
+fw = load_dataset(
+    "HuggingFaceFW/fineweb-edu", name=remote_name, split="train", streaming=True
+)
 
 # init the tokenizer
-enc = tiktoken.get_encoding('gpt2')
-eot = enc._special_tokens['<|endoftext|>'] # end of text token
+enc = tiktoken.get_encoding("gpt2")
+eot = enc._special_tokens["<|endoftext|>"]  # end of text token
+
 
 def tokenize(doc):
     # tokenizes a single document and returns a mupy array of uint16 tokens
     tokens = [eot]
     tokens.extend(enc.encode_ordinary(doc["text"]))
     tokens_np = np.array(tokens)
-    assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
+    assert (0 <= tokens_np).all() and (
+        tokens_np < 2**16
+    ).all(), "token dictionary too large for uint16"
     tokens_np_uint16 = tokens_np.astype(np.uint16)
     return tokens_np_uint16
 
 
 def write_datafile(filename, tokens_np):
     np.save(filename, tokens_np)
+
 
 # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
 nprocs = max(1, (os.cpu_count() or 1) // 2)
@@ -51,25 +57,29 @@ with mp.Pool(nprocs) as pool:
         # is there enough space in the current shard for the new tokens?
         if token_count + len(tokens) < shard_size:
             # simply append tokens to current shard
-            all_tokens_np[token_count:token_count+len(tokens)] = tokens
+            all_tokens_np[token_count : token_count + len(tokens)] = tokens
             token_count += len(tokens)
             # update progress bar
             if progress_bar is None:
-                progress_bar = tqdm(total=shard_size, unit="tokens", desc=f"Shard {shard_index}")
+                progress_bar = tqdm(
+                    total=shard_size, unit="tokens", desc=f"Shard {shard_index}"
+                )
             progress_bar.update(len(tokens))
         else:
             # write the current shard and start a new one
             split = "val" if shard_index == 0 else "train"
-            filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}")
+            filename = os.path.join(
+                DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}"
+            )
             # split the document into whatever fits in this shard; remainder goes to next one
             remainder = shard_size - token_count
-            progress_bar.update(remainder) # pyrefly: ignore
-            all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
+            progress_bar.update(remainder)  # pyrefly: ignore
+            all_tokens_np[token_count : token_count + remainder] = tokens[:remainder]
             write_datafile(filename, all_tokens_np)
             shard_index += 1
             progress_bar = None
             # populate the next shard with the leftovers of the current doc
-            all_tokens_np[0:len(tokens)-remainder] = tokens[remainder:]
+            all_tokens_np[0 : len(tokens) - remainder] = tokens[remainder:]
             token_count = len(tokens) - remainder
 
     # write any remaining tokens as the last shard

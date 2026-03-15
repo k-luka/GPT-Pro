@@ -1,7 +1,7 @@
 import torch
 from dataclasses import dataclass
-from src.data import DataLoader
-from src.evaluator import estimate_loss, evaluate_hella_swag
+from src.datasets.dataloader import DataLoader
+from src.eval.metrics import estimate_loss, evaluate_hella_swag
 import time
 import math
 import os
@@ -9,8 +9,6 @@ import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 import torch.distributed.checkpoint
-import transformer_engine.pytorch as te
-from transformer_engine.common.recipe import Format, DelayedScaling
 
 
 @dataclass
@@ -78,16 +76,9 @@ class Trainer:
         self.tokenizer = tokenizer
         self.step = 0
 
-        self.fp8_format = Format.HYBRID
-        self.fp8_recipe = DelayedScaling(
-            fp8_format=self.fp8_format, amax_history_len=16, amax_compute_algo="max"
-        )
-        # # The model is in bf16 so gradients are calculated in bf16. 
-        # # This is fine but I have high grad accumulation steps which means the accumulated grad can overflow
-        # # So I calculate in bf16 but accumulate in float32
-        # for param in self.model.parameters():
-        #     if param.requires_grad:
-        #         param.main_grad = torch.zeros_like(param, dtype=torch.float32)
+        for param in self.model.parameters():
+            if param.requires_grad:
+                param.main_grad = torch.zeros_like(param, dtype=torch.float32)
 
     def get_lr(self, it):
         if it < self.config.warmup_steps:
@@ -103,33 +94,37 @@ class Trainer:
 
     def _train_global_batch(self):
         self.optimizer.zero_grad()
+        for param in self.model.parameters():
+            if param.requires_grad and hasattr(param, "main_grad"):
+                param.main_grad.zero_()
+
         loss_accum = 0.0
-
-        # for param in self.model.parameters():
-        #     if param.requires_grad and hasattr(param, "main_grad"):
-        #         param.main_grad.zero_()
-
         for step in range(self.config.grad_accum_steps):
             x, y = next(self.train_loader)
             x, y = x.to(self.config.device), y.to(self.config.device)
-            torch.compiler.cudagraph_mark_step_begin()
             with torch.autocast(device_type=self.config.device, dtype=torch.bfloat16):
-                with te.autocast(enabled=True, recipe=self.fp8_recipe):
-                    _, loss = self.model(x, y)
+                _, loss = self.model(x, y)
             loss = (
                 loss / self.config.grad_accum_steps
             )  # scale loss as otherwise it would accumulate
             loss_accum += loss.detach()
             loss.backward()
-            # # Accumulate the grad in float32
-            # for param in self.model.parameters():
-            #     if param.requires_grad and hasattr(param, "main_grad") and param.main_grad is not None and param.grad is not None:
-            #         param.main_grad.add_(param.grad.float())
-            #         param.grad = None
-        
-        # for param in self.model.parameters():
-        #     if param.requires_grad and hasattr(param, "main_grad") and param.grad is None and param.main_grad is not None:
-        #         param.grad = param.main_grad.to(param.dtype)
+            # Calculate gradients in bf16 but accumulate gradients in float32
+            for param in self.model.parameters():
+                if (
+                    param.requires_grad
+                    and hasattr(param, "main_grad")
+                    and param.grad is not None
+                ):
+                    param.main_grad.add_(param.grad)
+                    param.grad = (
+                        None  # Immediatly let go of the bf16 grads to free memory
+                    )
+
+        # Reassign the accumulated gradients
+        for param in self.model.parameters():
+            if param.requiers_grad and hasattr(param, "main_grad"):
+                param.grad = param.main_grad.to(param.dtype)
 
         torch.nn.utils.clip_grad_norm_(
             self.model.parameters(), 1.0
@@ -168,7 +163,6 @@ class Trainer:
                 print(
                     f"---| Resuming training from step {start_step} until {self.config.max_steps} |---"
                 )
-            self.train_loader.set_step(self.step, self.config.grad_accum_steps)
 
         else:
             if self.rank == 0:
@@ -201,13 +195,12 @@ class Trainer:
                             "train loss": float(loss),
                             "tokens/sec": float(tps),
                             "train step time (ms)": dt * 1000,
-                        },
-                        step = step
+                        }
                     )
                 # print train loss and stats to console
                 if step % self.config.logging_steps == 0:
                     print(
-                        f"Step: {step} | loss: {loss:.6f} | dt: {dt * 1000:.4f} ms | tokens/sec: {tps:.4f}"
+                        f"Step: {step} | loss: {loss:.6f} | dt: {dt*1000:.4f} ms | tokens/sec: {tps:.4f}"
                     )
             # eval loss and report it
             val_loss = None
@@ -228,8 +221,7 @@ class Trainer:
                 if self.rank == 0:
                     if self.wandb_run is not None:
                         self.wandb_run.log(
-                            {"val loss": val_loss, "HellaSwag accuracy": hella_acc},
-                            step = step
+                            {"val loss": val_loss, "HellaSwag accuracy": hella_acc}
                         )
             # once in a while save checkpoint
             if step % self.config.checkpoint_interval == 0:
@@ -250,16 +242,8 @@ class Trainer:
 
     def save_checkpoint(self, val_loss, step, is_best=False):
         """Saves a checkpoint using PyTorch DCP"""
-        if is_best==True:
-            checkpoint_path = f"output/checkpoints/{self.config.run_name}/best_val"
-            if self.rank == 0 and os.path.exists(checkpoint_path):
-                import shutil
-                shutil.rmtree(checkpoint_path)
-            # Synchronize: all ranks must wait for rank 0 to finish deleting
-            dist.barrier()
-        else:
-            checkpoint_path = f"output/checkpoints/{self.config.run_name}/step_{step}"
 
+        checkpoint_path = f"output/checkpoints/{self.config.run_name}/step_{step}"
         os.makedirs(checkpoint_path, exist_ok=True)
         if self.rank == 0:
             print(f"---| Saving checkpoint to {checkpoint_path} |---")
@@ -307,5 +291,3 @@ class Trainer:
                 checkpoint_path
             ),
         )
-        self.step = step_tensor.item() # pyrefly:ignore
-

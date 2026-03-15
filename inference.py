@@ -7,7 +7,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from omegaconf import DictConfig, OmegaConf
 
-from src.te_versions.model_te import GPT
+from src.models.gpt_te import GPT
 
 
 def maybe_init_dist(device: str):
@@ -45,7 +45,9 @@ def _load_state(model, state_dict: dict):
 
 
 def load_checkpoint_any_format(model, checkpoint_path: str, device: torch.device):
-    if os.path.isdir(checkpoint_path) and os.path.exists(os.path.join(checkpoint_path, ".metadata")):
+    if os.path.isdir(checkpoint_path) and os.path.exists(
+        os.path.join(checkpoint_path, ".metadata")
+    ):
         # Load raw tensors first, then apply to module. This avoids pickling
         # issues with compiled/module code objects during DCP planning.
         state = {"model": model.state_dict()}
@@ -119,7 +121,7 @@ def cleanup_dist():
         dist.destroy_process_group()
 
 
-@hydra.main(version_base=None, config_name="config_inference", config_path="../config")
+@hydra.main(version_base=None, config_name="config_inference", config_path="./config")
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
 
@@ -142,7 +144,7 @@ def main(cfg: DictConfig):
             user_input = input("User: ")
         except (KeyboardInterrupt, EOFError):
             break
-        
+
         if user_input.strip().lower() in ["exit", "quit"]:
             break
 
