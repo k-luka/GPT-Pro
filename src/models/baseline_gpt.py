@@ -1,95 +1,15 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import inspect
-import math
+import torch.nn as nn
 from src.utils.helpers import apply_rotary_emb
-import torch.distributed as dist
+import math
+import inspect
+
+"""
+Implements a base model to compare future tests against
+"""
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        return F.rms_norm(x, (x.size(-1),), self.weight, self.eps)
-
-
-class MLA(nn.Module):
-    def __init__(
-        self, n_embd, n_heads, head_size, rope_head_size, kv_latent_size, q_latent_size
-    ):
-        super().__init__()
-        self.n_embd = n_embd
-        self.n_heads = n_heads
-        self.head_size = head_size
-        self.rope_head_size = rope_head_size
-        self.latent_head_size = head_size - rope_head_size
-        self.kv_latent_size = kv_latent_size
-
-        self.w_down_q = nn.Linear(n_embd, q_latent_size, bias=False)
-        self.w_kva = nn.Linear(n_embd, kv_latent_size + rope_head_size, bias=False)
-
-        self.q_norm = nn.RMSNorm(q_latent_size, dtype=torch.bfloat16)
-        self.kv_norm = nn.RMSNorm(kv_latent_size, dtype=torch.bfloat16)
-
-        # q = (q_content and q_rope) per head
-        self.w_up_qr = nn.Linear(
-            q_latent_size,
-            n_heads * (self.latent_head_size + rope_head_size),
-            bias=False,
-        )
-        self.w_up_kv = nn.Linear(
-            kv_latent_size, n_heads * (self.latent_head_size + head_size), bias=False
-        )
-
-        self.proj = nn.Linear(n_heads * head_size, n_embd, bias=False)
-        self.proj.RESIDUAL_SCALE_INIT_FACTOR = True  # pyrefly: ignore
-
-    def forward(self, x, sin, cos):
-        B, T, _ = x.shape
-        H = self.n_heads
-        d_c = self.latent_head_size
-        d_r = self.rope_head_size
-        d = self.head_size
-
-        # --- Q ---
-        c_q = self.q_norm(self.w_down_q(x))
-
-        q_lr = self.w_up_qr(c_q).view(B, T, H, d).transpose(1, 2)
-        q_l = q_lr[..., :d_c]
-        q_r = q_lr[..., d_c:]
-        q_r = apply_rotary_emb(q_r, sin, cos)
-        q = torch.cat((q_l, q_r), dim=-1).contiguous()
-
-        # --- KV ---
-        c_kv_rope = self.w_kva(x)
-        c_kv = c_kv_rope[..., : self.kv_latent_size]
-        c_kr = c_kv_rope[..., self.kv_latent_size :]
-
-        # shared k_rope accross all heads
-        k_r = apply_rotary_emb(c_kr.unsqueeze(1), sin, cos)
-
-        c_kv = self.kv_norm(c_kv)
-        kv = (
-            self.w_up_kv(c_kv).view(B, T, H, d_c + d).transpose(1, 2)
-        )  # (B, H, T, d_c + d)
-        k_l = kv[..., :d_c]
-        v = kv[..., d_c:]
-
-        k = torch.cat(
-            (k_l, k_r.expand(B, H, T, d_r)), dim=-1
-        ).contiguous()  # (B, H, T, d)
-        v = v.contiguous()
-
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        out = out.transpose(1, 2).view(B, T, H * d)
-        return self.proj(out)
-
-
-# Attention (Regular Attention but fast)
 class Attention(nn.Module):
     def __init__(self, n_embd, n_heads):
         super().__init__()
@@ -116,69 +36,37 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q, sin, cos)
         k = apply_rotary_emb(k, sin, cos)
         q, k = self.q_norm(q), self.k_norm(k)
-        # att = q @ k.tranpose(-2,-1) / (1 * math.sqrt(self.H)) # (B,n_heads,T,T)
-        # att = att.masked_fill(self.tril[:,:,:T,:T], float("-inf"))
-        # out = att @ v # (B,n_heds,T,H)
-        out = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True
-        )  # Abstraction but uses flash att for 20% faster training
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.proj(out)
 
 
-# # Feed Forward (Deprecated, replaced with SwiGLU, see below)
-# class MLP(nn.Module):
-#     def __init__(self, n_embd):
-#         super().__init__()
-#         self.n_embd = n_embd
-#         self.ffwd = nn.Linear(n_embd, 4 * n_embd)
-#         self.gelu = nn.GELU() # NOTE: Compare the speed of approximate and exact version
-#         self.proj = nn.Linear(4 * n_embd, n_embd)
-#         self.proj.RESIDUAL_SCALE_INIT_FACTOR = True # pyrefly: ignore
-
-#     def forward(self, x):
-#         x = self.ffwd(x)
-#         x = self.gelu(x)
-#         x = self.proj(x)
-#         return x
-
-
-# SwiGLU MLP
+# SwiGLU mlp
 class MLP(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.n_embd = n_embd
-        hidden_dim = int(8 * n_embd / 3)
+        hidden_dim = int(8 * n_embd // 3)
         self.hidden_dim = (
             (hidden_dim + 255) // 256 * 256
-        )  # ensures hidden_dim is divisble by 256 (it will be 2,816 for n_emb=1024)
-
-        self.gate_proj = nn.Linear(n_embd, self.hidden_dim, bias=False)
-        self.up_proj = nn.Linear(n_embd, self.hidden_dim, bias=False)
-        self.down_proj = nn.Linear(self.hidden_dim, n_embd, bias=False)
-        self.down_proj.RESIDUAL_SCALE_INIT_FACTOR = (
-            True  # pyrefly: ignore.  This is for weight initialization
-        )
+        )  # ensures it's divisible by 256 for speed
+        self.gate_proj = nn.Linear(n_embd, self.hidden_dim * 2)
+        self.down_proj = nn.Linear(self.hidden_dim, n_embd)
+        self.down_proj.RESIDUAL_SCALE_INIT_FACOTR = True  # pyrefly: ignore
 
     def forward(self, x):
-        gate = F.silu(self.gate_proj(x))  # gate projection (decides what passes)
-        value = self.up_proj(x)  # up projection (raw computation)
-        x = gate * value
-        x = self.down_proj(x)  # back down to residual stream
-        return x
+        y, gate = torch.chunk(self.gate_proj(x), 2, dim=-1)
+        gate = F.silu(gate)
+        y = gate * y
+        return self.down_proj(y)
 
 
 # Block
 class Block(nn.Module):
-    def __init__(
-        self, n_embd, n_heads, head_size, rope_head_size, kv_latent_size, q_latent_size
-    ):
+    def __init__(self, n_embd, n_heads):
         super().__init__()
-        # self.ln1 = nn.LayerNorm(n_embd) # Replaced with RMSNorm for better performance
         self.ln1 = nn.RMSNorm(n_embd)
         self.sa = Attention(n_embd, n_heads)
-        # self.sa = MLA(n_embd, n_heads, head_size, rope_head_size, kv_latent_size, q_latent_size)
-        # self.ln2 = nn.LayerNorm(n_embd)
         self.ln2 = nn.RMSNorm(n_embd)
         self.mlp = MLP(n_embd)
 
@@ -206,11 +94,10 @@ class GPT(nn.Module):
         self.block_size = block_size
         self.n_embd = n_embd
         self.n_layers = n_layers
-        # self.wpe = nn.Embedding(block_size, n_embd)  # old learned positional embeddings
         self.wte = nn.Embedding(vocab_size, n_embd)
 
         sin, cos = self._precompute_rotary_embeddings(
-            block_size, rope_head_size
+            block_size, head_size
         )  # pyrefly: ignore
         self.register_buffer("sin", sin)
         self.register_buffer("cos", cos)
@@ -219,27 +106,21 @@ class GPT(nn.Module):
                 Block(
                     n_embd,
                     n_heads,
-                    head_size,
-                    rope_head_size,
-                    kv_latent_size,
-                    q_latent_size,
                 )
                 for _ in range(n_layers)
             ]
         )
-        self.ln = RMSNorm(n_embd)
+        self.ln = nn.RMSNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
         self.wte.weight = (
             self.lm_head.weight
         )  # Embedding layer and final calssifier are the same
         self.apply(self._init_weights)
-        self.rank = dist.get_rank()
 
     # initialize weights
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            # std = 1 / math.sqrt(self.n_embd) is what GPT-3 says
-            # But DeepSeek says to go lower!
+            # std = 1 / math.sqrt(self.n_embd) is what GPT-3 says but DeepSeek says to go lower
             std = 0.01
             if hasattr(module, "RESIDUAL_SCALE_INIT_FACTOR"):
                 std *= 1 / (math.sqrt(2 * self.n_layers))
@@ -256,9 +137,6 @@ class GPT(nn.Module):
             T <= self.block_size
         ), f"Sequence length ({T}) is longer than the block_size ({self.block_size})."
         x = self.wte(idx)  # (B,T,C)
-        # # old code with learned positional embedding
-        # pos_emb = self.wpe(torch.arange(0, T, dtype=torch.long, device=idx.device)) # (T,C)
-        # x = tok_emb + pos_emb
         sin = self.sin[:, :, :T, :]  # pyrefly: ignore
         cos = self.cos[:, :, :T, :]  # pyrefly: ignore
 
@@ -321,22 +199,19 @@ class GPT(nn.Module):
             {"params": nodecay_params, "weight_decay": 0.0},
         ]
 
-        # Print debug stats (rank 0 only)
-        if self.rank == 0:
-            num_decay = sum(p.numel() for p in decay_params)
-            num_nodecay = sum(p.numel() for p in nodecay_params)
-            print(
-                f"Decayed params (2D): {len(decay_params)} tensors, {num_decay:,} parameters"
-            )
-            print(
-                f"Non-decayed params (1D): {len(nodecay_params)} tensors, {num_nodecay:,} parameters"
-            )
+        num_decay = sum(p.numel() for p in decay_params)
+        num_nodecay = sum(p.numel() for p in nodecay_params)
+        print(
+            f"Decayed params (2D): {len(decay_params)} tensors, {num_decay:,} parameters"
+        )
+        print(
+            f"Non-decayed params (1D): {len(nodecay_params)} tensors, {num_nodecay:,} parameters"
+        )
 
         # Configure fused AdamW if available
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and "cuda" in str(device)
-        if self.rank == 0:
-            print(f"Using fused AdamW: {use_fused}")
+        print(f"Using fused AdamW: {use_fused}")
 
         optimizer = torch.optim.AdamW(
             optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
@@ -353,6 +228,7 @@ class GPT(nn.Module):
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         # calculate the rotation frequency at each (time, channel) pair
         freqs = torch.outer(t, inv_freq)
+        freqs = torch.cat((freqs, freqs), dim=-1)
         sin, cos = freqs.sin(), freqs.cos()
         sin, cos = sin.bfloat16(), cos.bfloat16()
         sin, cos = sin[None, None, :, :], cos[None, None, :, :]

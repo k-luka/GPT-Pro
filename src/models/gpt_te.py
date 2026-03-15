@@ -638,8 +638,8 @@ class GPT(nn.Module):
             # These modules all have a standard .weight attribute
             if hasattr(module, "weight"):
                 torch.nn.init.normal_(
-                    module.weight, mean=0.0, std=std # pyrefly: ignore
-                ) 
+                    module.weight, mean=0.0, std=std  # pyrefly: ignore
+                )
 
             if hasattr(module, "bias") and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)  # pyrefly: ignore
@@ -649,13 +649,13 @@ class GPT(nn.Module):
             if hasattr(module, "weight"):
                 # Just in case future versions use 'weight'
                 torch.nn.init.normal_(
-                    module.weight, mean=0.0, std=std # pyrefly: ignore
-                )  
+                    module.weight, mean=0.0, std=std  # pyrefly: ignore
+                )
             elif hasattr(module, "weight0"):
                 # THIS IS THE FIX: Initialize weight0
                 torch.nn.init.normal_(
-                    module.weight0, mean=0.0, std=std # pyrefly: ignore
-                )  
+                    module.weight0, mean=0.0, std=std  # pyrefly: ignore
+                )
 
             # It usually doesn't have bias in MoE, but safe
             if hasattr(module, "bias") and module.bias is not None:

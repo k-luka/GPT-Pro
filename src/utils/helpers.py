@@ -39,15 +39,17 @@ def print_trainable_parameters(cfg, model):
     params_mla = mla_down_q + mla_down_kv + mla_norms + mla_up_q + mla_up_kv + mla_proj
 
     # --- MoE (Shared + Routed) ---
-    s_hidden_req = cfg.model.n_shared_experts * cfg.model.expert_hidden_size
+    s_hidden_req = cfg.model.get("n_shared_experts", 0) * cfg.model.get(
+        "expert_hidden_size", 0
+    )
     s_hidden = (s_hidden_req + 255) // 256 * 256
     # Gate + Up (swiglu usually 2 matrices) + Down. No bias.
     params_shared = (n_embd * s_hidden) + (n_embd * s_hidden) + (s_hidden * n_embd)
 
     # Routed Experts
-    n_routed = cfg.model.n_routed_experts
-    topk = cfg.model.topk_experts
-    expert_hidden = cfg.model.expert_hidden_size
+    n_routed = cfg.model.get("n_routed_experts", 0)
+    topk = cfg.model.get("topk_experts", 0)
+    expert_hidden = cfg.model.get("expert_hidden_size", 0)
 
     # SwiGLU: (n_embd -> 2*h) + (h -> n_embd) -> 3 * n_embd * h
     params_per_expert = 3 * n_embd * expert_hidden
@@ -77,7 +79,7 @@ def print_trainable_parameters(cfg, model):
     print(f"| Config: {cfg.experiment.run_name}")
     print(f"| Architecture: {n_layers} layers, {n_heads} heads, {n_embd} dim")
     print(
-        f"| Experts: {n_routed} routed, {cfg.model.n_shared_experts} shared, TopK: {topk}"
+        f"| Experts: {n_routed} routed, {cfg.model.get('n_shared_experts', 0)} shared, TopK: {topk}"
     )
     print("| --------------------------------------------------------------------")
     print(
@@ -114,15 +116,17 @@ def estimate_flops(cfg):
     params_mla = mla_down_q + mla_down_kv + mla_norms + mla_up_q + mla_up_kv + mla_proj
 
     # MoE Active Params per layer
-    s_hidden_req = cfg.model.n_shared_experts * cfg.model.expert_hidden_size
+    s_hidden_req = cfg.model.get("n_shared_experts", 0) * cfg.model.get(
+        "expert_hidden_size", 0
+    )
     s_hidden = (s_hidden_req + 255) // 256 * 256
     params_shared = (n_embd * s_hidden) * 3
 
-    topk = cfg.model.topk_experts
-    expert_hidden = cfg.model.expert_hidden_size
+    topk = cfg.model.get("topk_experts", 0)
+    expert_hidden = cfg.model.get("expert_hidden_size", 0)
     params_per_expert = 3 * n_embd * expert_hidden
 
-    params_gate = n_embd * cfg.model.n_routed_experts
+    params_gate = n_embd * cfg.model.get("n_routed_experts", 0)
 
     params_moe_active = params_shared + params_gate + (topk * params_per_expert)
     params_block_ln = 2 * n_embd
