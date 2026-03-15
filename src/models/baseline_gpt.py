@@ -19,8 +19,8 @@ class Attention(nn.Module):
         self.n_embd = n_embd
         self.n_heads = n_heads
         self.H = n_embd // n_heads  # head size
-        self.attn = nn.Linear(n_embd, 3 * n_embd)
-        self.proj = nn.Linear(n_embd, n_embd)
+        self.attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.proj = nn.Linear(n_embd, n_embd, bias=False)
         self.q_norm = nn.RMSNorm(self.H)
         self.k_norm = nn.RMSNorm(self.H)
         self.proj.RESIDUAL_SCALE_INIT_FACTOR = True  # pyrefly: ignore
@@ -50,8 +50,8 @@ class MLP(nn.Module):
         self.hidden_dim = (
             (hidden_dim + 255) // 256 * 256
         )  # ensures it's divisible by 256 for speed
-        self.gate_proj = nn.Linear(n_embd, self.hidden_dim * 2)
-        self.down_proj = nn.Linear(self.hidden_dim, n_embd)
+        self.gate_proj = nn.Linear(n_embd, self.hidden_dim * 2, bias=False)
+        self.down_proj = nn.Linear(self.hidden_dim, n_embd, bias=False)
         self.down_proj.RESIDUAL_SCALE_INIT_FACOTR = True  # pyrefly: ignore
 
     def forward(self, x):

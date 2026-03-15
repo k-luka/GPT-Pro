@@ -4,7 +4,7 @@ hydra:
 
 experiment:
   project: "GPT_Small"
-  run_name: "M_0"
+  run_name: "no_bias"
 
 model:
   vocab_size: 50304
