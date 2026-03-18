@@ -4,14 +4,30 @@ from omegaconf import DictConfig, OmegaConf
 from typing import Any, cast
 import os
 import wandb
+import random
+import numpy as np
 
 from src.models.baseline_gpt import GPT
 from src.training.trainer_single_gpu import TrainerSingleGPU, TrainerConfig
 from src.utils.helpers import print_trainable_parameters, estimate_flops
 
 
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # When running on the CuDNN backend, two further options must be set for full reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 @hydra.main(version_base=None, config_name="config_basemodel", config_path="config")
 def main(cfg: DictConfig):
+    # Set seed for reproducibility before any other operations
+    seed = cfg.experiment.get("seed", 42)
+    set_seed(seed)
+
     # Enforce strict single GPU execution
     device_obj = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

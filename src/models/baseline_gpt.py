@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from src.utils.helpers import apply_rotary_emb
+from src.utils.optimizers import Muon, DualOptimizer
 import math
 import inspect
 
@@ -96,8 +97,9 @@ class GPT(nn.Module):
         self.n_layers = n_layers
         self.wte = nn.Embedding(vocab_size, n_embd)
 
+        # Precompute RoPE with the actual head dimension (n_embd // n_heads)
         sin, cos = self._precompute_rotary_embeddings(
-            block_size, head_size
+            block_size, (n_embd // n_heads)
         )  # pyrefly: ignore
         self.register_buffer("sin", sin)
         self.register_buffer("cos", cos)
@@ -194,10 +196,10 @@ class GPT(nn.Module):
         decay_params = [p for p in unique_params if p.dim() >= 2]
         nodecay_params = [p for p in unique_params if p.dim() < 2]
 
-        optim_groups = [
-            {"params": decay_params, "weight_decay": weight_decay},
-            {"params": nodecay_params, "weight_decay": 0.0},
-        ]
+        # optim_groups = [
+        #     {"params": decay_params, "weight_decay": weight_decay},
+        #     {"params": nodecay_params, "weight_decay": 0.0},
+        # ]
 
         num_decay = sum(p.numel() for p in decay_params)
         num_nodecay = sum(p.numel() for p in nodecay_params)
@@ -213,10 +215,24 @@ class GPT(nn.Module):
         use_fused = fused_available and "cuda" in str(device)
         print(f"Using fused AdamW: {use_fused}")
 
-        optimizer = torch.optim.AdamW(
-            optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
+        # optimizer = torch.optim.AdamW(
+        #     optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
+        # )
+        # return optimizer
+
+        adam_opt = torch.optim.AdamW(
+            [{"params": nodecay_params, "weight_decay": 0.0}],
+            lr=learning_rate,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            fused=use_fused,
         )
-        return optimizer
+
+        # Typically Muon relies on its own momentum and learning rate scaling
+        # (often 10x - 50x higher than Adam, but here we just pass the base config lr)
+        muon_opt = Muon([{"params": decay_params}], lr=learning_rate, momentum=0.95)
+
+        return DualOptimizer(adam_opt, muon_opt)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:

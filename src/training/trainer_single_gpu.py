@@ -135,21 +135,28 @@ class TrainerSingleGPU:
                     f"Step: {step} | loss: {loss:.6f} | dt: {dt * 1000:.4f} ms | tokens/sec: {tps:.4f}"
                 )
 
-
-
-
-
-            if self.tokenizer is not None and step % self.config.generation_interval == 0:
+            if (
+                self.tokenizer is not None
+                and step % self.config.generation_interval == 0
+            ):
                 print(f"\n--- Generating text at step {step} ---", flush=True)
                 context = "Once upon a time"
-                idx = torch.tensor(self.tokenizer.encode(context), dtype=torch.long, device=self.config.device)
-                unwrap_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+                idx = torch.tensor(
+                    self.tokenizer.encode(context),
+                    dtype=torch.long,
+                    device=self.config.device,
+                )
+                unwrap_model = (
+                    self.model._orig_mod
+                    if hasattr(self.model, "_orig_mod")
+                    else self.model
+                )
                 unwrap_model.eval()
                 with torch.no_grad():
                     out = unwrap_model.generate(idx, max_tokens=64, num_sequences=3)
                 unwrap_model.train()
                 for i in range(out.size(0)):
-                    
+
                     gen_tokens = out[i].tolist()
                     # Model has padded vocab size (50304), but tokenizer only knows up to 50256
                     gen_tokens = [t if t < 50257 else 50256 for t in gen_tokens]
@@ -160,7 +167,6 @@ class TrainerSingleGPU:
                 torch.cuda.empty_cache()
 
             val_loss = None
-
 
             if step % self.config.eval_interval == 0:
                 val_loss = estimate_loss(
