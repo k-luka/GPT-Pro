@@ -4,7 +4,7 @@ hydra:
 
 experiment:
   project: "GPT_Pro"
-  run_name: "LM_2"
+  run_name: "LM_3"
 
 model:
   vocab_size: 50304
@@ -32,7 +32,7 @@ training:
   grad_accum_steps: 8
 
   # Logistics
-  logging_steps: 100
+  logging_steps: 1
   checkpoint_interval: 8000
   generation_interval: 10000000
   eval_interval: 400
@@ -47,4 +47,4 @@ training:
   min_lr: 2.0e-5
   weight_decay: 0.1
   
-resume_checkpoint: output/checkpoints/LM_2/best_val
+# resume_checkpoint: output/checkpoints/LM_2/best_val

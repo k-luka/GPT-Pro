@@ -228,9 +228,7 @@ class GPT(nn.Module):
             fused=use_fused,
         )
 
-        # Typically Muon relies on its own momentum and learning rate scaling
-        # (often 10x - 50x higher than Adam, but here we just pass the base config lr)
-        muon_opt = Muon([{"params": decay_params}], lr=learning_rate, momentum=0.95)
+        muon_opt = Muon([{"params": decay_params}], lr=learning_rate * 20, momentum=0.95)
 
         return DualOptimizer(adam_opt, muon_opt)
 

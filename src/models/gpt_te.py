@@ -525,6 +525,7 @@ class Block(nn.Module):
             q_latent_size,
             dtype=dtype,
         )
+        # self.sa = Attention(n_embd, n_heads, dtype=dtype)
         self.sa_compiled = torch.compile(self.sa)  # pyrefly:ignore
         self.ln2 = te.RMSNorm(n_embd, params_dtype=dtype)
         self.moe = ExpertParallelMoE(
