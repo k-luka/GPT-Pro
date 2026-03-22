@@ -1,10 +1,10 @@
 """
-Offline data preparation for ClimbMix-400B with Qwen 3.5 tokenizer.
+Offline data preparation for ClimbMix-400B with DeepSeek V3 tokenizer.
 
 Pipeline:
   1. Stream karpathy/climbmix-400b-shuffle from Hugging Face
-  2. Tokenize every document with the Qwen 3.5 tokenizer
-  3. Concatenate documents separated by <|endoftext|>  (sequence packing)
+  2. Tokenize every document with the DeepSeek V3 tokenizer
+  3. Concatenate documents separated by the EOS token  (sequence packing)
   4. Slice the flat token stream into shards whose length is an exact
      multiple of block_size  (no padding, no masking at train time)
   5. Write each shard as a dense uint32 .bin file
@@ -26,7 +26,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-TOKENIZER_NAME = "Qwen/Qwen2.5-0.5B"
+TOKENIZER_NAME = "deepseek-ai/DeepSeek-V3-Base"
 DATASET_NAME = "karpathy/climbmix-400b-shuffle"
 SHARD_SIZE = int(1e8)  # 100M tokens per shard
 
@@ -40,11 +40,11 @@ def _init_worker(tokenizer_name: str) -> None:
     _worker_tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_name, trust_remote_code=True
     )
-    _worker_eot_id = _worker_tokenizer.convert_tokens_to_ids("<|endoftext|>")
+    _worker_eot_id = _worker_tokenizer.eos_token_id
 
 
 def _tokenize(doc: dict) -> np.ndarray:
-    """Prepend <|endoftext|> then tokenize the document body."""
+    """Prepend the EOS token then tokenize the document body."""
     assert _worker_tokenizer is not None and _worker_eot_id is not None
     tokens = [_worker_eot_id]
     tokens.extend(_worker_tokenizer.encode(doc["text"], add_special_tokens=False))
@@ -98,10 +98,10 @@ def main() -> None:
 
     # ── print config ──────────────────────────────────────────────────────────
     tok = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
-    eot_id = tok.convert_tokens_to_ids("<|endoftext|>")
+    eot_id = tok.eos_token_id
     print(f"Tokenizer     : {args.tokenizer}")
     print(f"Vocab size    : {tok.vocab_size}")
-    print(f"<|endoftext|> : {eot_id}")
+    print(f"EOS Token ID  : {eot_id} ({tok.eos_token})")
     print(f"Block size    : {args.block_size}")
     print(f"Shard size    : {args.shard_size:,} tokens")
     print(f"Output dir    : {args.output_dir}")
