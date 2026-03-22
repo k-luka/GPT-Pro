@@ -10,96 +10,35 @@ import json
 import os
 
 
-class MLA(nn.Module):
-    def __init__(
-        self,
-        n_embd,
-        n_heads,
-        head_size,
-        rope_head_size,
-        kv_latent_size,
-        q_latent_size,
-        dtype=None,
-    ):
+class GQA(nn.Module):
+    def __init__(self, n_embd, n_heads, n_kv_heads, dtype=None):
         super().__init__()
-        self.n_embd = n_embd
+        assert n_embd % n_heads == 0, "n_embd must be divisible by n_heads"
+        assert n_heads % n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
         self.n_heads = n_heads
-        self.head_size = head_size
-        self.rope_head_size = rope_head_size
-        self.latent_head_size = head_size - rope_head_size
-        self.kv_latent_size = kv_latent_size
-        self.q_latent_size = q_latent_size
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = n_embd // n_heads
 
-        # Fused Down-Projection
-        # Projects x into ALL latent vectors at once: (Q_latent | KV_latent | K_rope)
-        self.w_down = te.Linear(
-            n_embd,
-            q_latent_size + kv_latent_size + rope_head_size,
-            bias=False,
-            params_dtype=dtype,
-        )
-
-        self.q_norm = nn.RMSNorm(q_latent_size, dtype=dtype)
-        self.kv_norm = nn.RMSNorm(kv_latent_size, dtype=dtype)
-
-        # Up-projections
-        self.w_up_qr = te.Linear(
-            q_latent_size,
-            n_heads * (self.latent_head_size + rope_head_size),
-            bias=False,
-            params_dtype=dtype,
-        )
-        self.w_up_kv = te.Linear(
-            kv_latent_size,
-            n_heads * (self.latent_head_size + head_size),
-            bias=False,
-            params_dtype=dtype,
-        )
-
-        self.proj = te.Linear(
-            n_heads * head_size, n_embd, bias=False, params_dtype=dtype
-        )
+        self.w_q = te.Linear(n_embd, n_heads * self.head_dim, bias=False, params_dtype=dtype)
+        self.w_k = te.Linear(n_embd, n_kv_heads * self.head_dim, bias=False, params_dtype=dtype)
+        self.w_v = te.Linear(n_embd, n_kv_heads * self.head_dim, bias=False, params_dtype=dtype)
+        self.proj = te.Linear(n_heads * self.head_dim, n_embd, bias=False, params_dtype=dtype)
         self.proj.RESIDUAL_SCALE_INIT_FACTOR = True
+
+        self.q_norm = nn.RMSNorm(self.head_dim, dtype=dtype)
+        self.k_norm = nn.RMSNorm(self.head_dim, dtype=dtype)
 
     def forward(self, x, sin, cos):
         B, T, _ = x.shape
-        H = self.n_heads
-        d_c = self.latent_head_size
 
-        # Fused Projection & Split
-        fused_down = self.w_down(x)
-        c_q, c_kv, k_rope = fused_down.split(
-            [self.q_latent_size, self.kv_latent_size, self.rope_head_size], dim=-1
-        )
+        q = self.w_q(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.w_k(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.w_v(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        # Normalization
-        c_q = self.q_norm(c_q)
-        c_kv = self.kv_norm(c_kv)
+        q = apply_rotary_emb(q, sin, cos)
+        k = apply_rotary_emb(k, sin, cos)
+        q, k = self.q_norm(q), self.k_norm(k)
 
-        # RoPE Shared Key (Optimization: Rotate the tiny shared key once)
-        # Reshape to (B, 1, T, 64) so it broadcasts to all heads later
-        k_rope = apply_rotary_emb(k_rope.unsqueeze(1), sin, cos)
-
-        # Generate Query (Q)
-        # Project up -> Split into Content & RoPE parts
-        q_lr = self.w_up_qr(c_q).view(B, T, H, -1).transpose(1, 2)
-        q_l = q_lr[..., :d_c]
-        q_r = q_lr[..., d_c:]
-
-        q_r = apply_rotary_emb(q_r, sin, cos)
-        q = torch.cat((q_l, q_r), dim=-1)  # (B, H, T, head_size)
-
-        # Generate Key/Value (K, V)
-        # Project up -> Split into Key-Content & Value
-        kv = self.w_up_kv(c_kv).view(B, T, H, -1).transpose(1, 2)
-
-        k_l = kv[..., :d_c]
-        v = kv[..., d_c:]  # Value is ready
-
-        # Combine Key-Content with the Shared RoPE Key
-        k = torch.cat((k_l, k_rope.expand(B, H, T, -1)), dim=-1)
-
-        # Attention
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
@@ -504,10 +443,7 @@ class Block(nn.Module):
         self,
         n_embd,
         n_heads,
-        head_size,
-        rope_head_size,
-        kv_latent_size,
-        q_latent_size,
+        n_kv_heads,
         n_shared_experts,
         n_routed_experts,
         topk,
@@ -516,16 +452,7 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.ln1 = te.RMSNorm(n_embd, params_dtype=dtype)
-        self.sa = MLA(
-            n_embd,
-            n_heads,
-            head_size,
-            rope_head_size,
-            kv_latent_size,
-            q_latent_size,
-            dtype=dtype,
-        )
-        # self.sa = Attention(n_embd, n_heads, dtype=dtype)
+        self.sa = GQA(n_embd, n_heads, n_kv_heads, dtype=dtype)
         self.sa_compiled = torch.compile(self.sa)  # pyrefly:ignore
         self.ln2 = te.RMSNorm(n_embd, params_dtype=dtype)
         self.moe = ExpertParallelMoE(
@@ -554,10 +481,7 @@ class GPT(nn.Module):
         vocab_size,
         block_size,
         n_heads,
-        head_size,
-        rope_head_size,
-        kv_latent_size,
-        q_latent_size,
+        n_kv_heads,
         n_layers,
         n_shared_experts,
         n_routed_experts,
@@ -572,7 +496,8 @@ class GPT(nn.Module):
         self.n_layers = n_layers
         self.wte = nn.Embedding(vocab_size, n_embd)
 
-        sin, cos = self._precompute_rotary_embeddings(block_size, rope_head_size)
+        head_dim = n_embd // n_heads
+        sin, cos = self._precompute_rotary_embeddings(block_size, head_dim)
         self.register_buffer("sin", sin, persistent=False)
         self.register_buffer("cos", cos, persistent=False)
         self.transformer = nn.ModuleList(
@@ -580,10 +505,7 @@ class GPT(nn.Module):
                 Block(
                     n_embd,
                     n_heads,
-                    head_size,
-                    rope_head_size,
-                    kv_latent_size,
-                    q_latent_size,
+                    n_kv_heads,
                     n_shared_experts,
                     n_routed_experts,
                     topk_experts,
