@@ -82,6 +82,7 @@ def main(cfg: DictConfig):
         warmup_steps=cfg.training.warmup_steps,
         min_lr=cfg.training.min_lr,
         max_lr=cfg.training.max_lr,
+        muon_lr_scale=cfg.training.get("muon_lr_scale", 30.0),
         weight_decay=cfg.training.weight_decay,
         logging_steps=cfg.training.logging_steps,
         checkpoint_interval=cfg.training.checkpoint_interval,

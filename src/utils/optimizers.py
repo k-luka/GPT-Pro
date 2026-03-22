@@ -23,17 +23,20 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=1e-3, momentum=0.95):
-        defaults = dict(lr=lr, momentum=momentum)
+    def __init__(self, params, lr=1e-3, momentum=0.95, weight_decay=0.0):
+        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
     def step(self):
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
+            wd = group["weight_decay"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
+                if wd != 0.0:
+                    p.data.mul_(1 - lr * wd)
                 g = p.grad
                 if g.ndim > 2:
                     g = g.view(g.size(0), -1)
@@ -61,6 +64,15 @@ class DualOptimizer:
     def step(self):
         self.adam_opt.step()
         self.muon_opt.step()
+
+    def get_adamw_params(self):
+        return [p for group in self.adam_opt.param_groups for p in group["params"]]
+
+    def set_lrs(self, adam_lr, muon_lr):
+        for group in self.adam_opt.param_groups:
+            group["lr"] = adam_lr
+        for group in self.muon_opt.param_groups:
+            group["lr"] = muon_lr
 
     def state_dict(self):
         return {

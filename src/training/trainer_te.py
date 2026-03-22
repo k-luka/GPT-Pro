@@ -7,7 +7,6 @@ import math
 import os
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 import torch.distributed.checkpoint
 import transformer_engine.pytorch as te
 from transformer_engine.common.recipe import Format, DelayedScaling
@@ -24,6 +23,7 @@ class TrainerConfig:
     min_lr: float = 1e-4
     max_lr: float = 6e-4
     learning_rate: float = 1e-4
+    muon_lr_scale: float = 30.0
     weight_decay: float = 0.1
     logging_steps: int = 1
     checkpoint_interval: int = 1000
@@ -51,6 +51,7 @@ class Trainer:
 
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
+        self.autocast_device_type = torch.device(self.config.device).type
 
         # Pass rank and world_size to DataLoader to fix data duplication
         self.train_loader = DataLoader(
@@ -73,7 +74,7 @@ class Trainer:
         self.optimizer = self.model.configure_optimizers(
             self.config.weight_decay,
             self.config.learning_rate,
-            self.config.device,
+            self.autocast_device_type,
         )
         self.tokenizer = tokenizer
         self.step = 0
@@ -103,7 +104,7 @@ class Trainer:
 
     def _train_global_batch(self):
         self.optimizer.zero_grad()
-        loss_accum = 0.0
+        loss_accum = torch.zeros((), device=self.config.device)
 
         # for param in self.model.parameters():
         #     if param.requires_grad and hasattr(param, "main_grad"):
@@ -113,7 +114,9 @@ class Trainer:
             x, y = next(self.train_loader)
             x, y = x.to(self.config.device), y.to(self.config.device)
             torch.compiler.cudagraph_mark_step_begin()
-            with torch.autocast(device_type=self.config.device, dtype=torch.bfloat16):
+            with torch.autocast(
+                device_type=self.autocast_device_type, dtype=torch.bfloat16
+            ):
                 with te.autocast(enabled=True, recipe=self.fp8_recipe):
                     _, loss = self.model(x, y)
             loss = (
@@ -121,11 +124,11 @@ class Trainer:
             )  # scale loss as otherwise it would accumulate
             loss_accum += loss.detach()
             loss.backward()
-            # # Accumulate the grad in float32
-            # for param in self.model.parameters():
-            #     if param.requires_grad and hasattr(param, "main_grad") and param.main_grad is not None and param.grad is not None:
-            #         param.main_grad.add_(param.grad.float())
-            #         param.grad = None
+        #     # Accumulate the grad in float32
+        #     for param in self.model.parameters():
+        #         if param.requires_grad and hasattr(param, "main_grad") and param.main_grad is not None and param.grad is not None:
+        #             param.main_grad.add_(param.grad.float())
+        #             param.grad = None
 
         # for param in self.model.parameters():
         #     if param.requires_grad and hasattr(param, "main_grad") and param.grad is None and param.main_grad is not None:
@@ -179,9 +182,13 @@ class Trainer:
             self.step = step
             t0 = time.time()
             # set the learning_rate
-            lr = self.get_lr(step)
-            for param_group in self.optimizer.param_groups:
-                param_group["lr"] = lr
+            adam_lr = self.get_lr(step)
+            muon_lr = adam_lr * self.config.muon_lr_scale
+            if hasattr(self.optimizer, "set_lrs"):
+                self.optimizer.set_lrs(adam_lr, muon_lr)
+            else:
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = adam_lr
             loss = self._train_global_batch()
             torch.cuda.synchronize()
             t1 = time.time()
@@ -201,13 +208,15 @@ class Trainer:
                             "train loss": float(loss),
                             "tokens/sec": float(tps),
                             "train step time (ms)": dt * 1000,
+                            "adam lr": float(adam_lr),
+                            "muon lr": float(muon_lr),
                         },
                         step=step,
                     )
                 # print train loss and stats to console
                 if step % self.config.logging_steps == 0:
                     print(
-                        f"Step: {step} | loss: {loss:.6f} | dt: {dt * 1000:.4f} ms | tokens/sec: {tps:.4f}"
+                        f"Step: {step} | loss: {loss:.6f} | dt: {dt * 1000:.4f} ms | tokens/sec: {tps:.4f} | adam lr: {adam_lr:.6e} | muon lr: {muon_lr:.6e}"
                     )
             # eval loss and report it
             val_loss = None

@@ -18,6 +18,7 @@ class TrainerConfig:
     min_lr: float = 1e-4
     max_lr: float = 6e-4
     learning_rate: float = 1e-4
+    muon_lr_scale: float = 30.0
     weight_decay: float = 0.1
     logging_steps: int = 1
     checkpoint_interval: int = 1000
@@ -83,7 +84,10 @@ class TrainerSingleGPU:
             loss_accum += loss.detach()
             loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        if hasattr(self.optimizer, "get_adamw_params"):
+            torch.nn.utils.clip_grad_norm_(self.optimizer.get_adamw_params(), 1.0)
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
         return loss_accum
 
@@ -106,9 +110,13 @@ class TrainerSingleGPU:
             self.step = step
             t0 = time.time()
 
-            lr = self.get_lr(step)
-            for param_group in self.optimizer.param_groups:
-                param_group["lr"] = lr
+            adam_lr = self.get_lr(step)
+            muon_lr = adam_lr * self.config.muon_lr_scale
+            if hasattr(self.optimizer, "set_lrs"):
+                self.optimizer.set_lrs(adam_lr, muon_lr)
+            else:
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = adam_lr
 
             loss = self._train_global_batch()
             torch.cuda.synchronize()
@@ -126,13 +134,15 @@ class TrainerSingleGPU:
                         "train loss": float(loss),
                         "tokens/sec": float(tps),
                         "train step time (ms)": dt * 1000,
+                        "adam lr": float(adam_lr),
+                        "muon lr": float(muon_lr),
                     },
                     step=step,
                 )
 
             if step % self.config.logging_steps == 0:
                 print(
-                    f"Step: {step} | loss: {loss:.6f} | dt: {dt * 1000:.4f} ms | tokens/sec: {tps:.4f}"
+                    f"Step: {step} | loss: {loss:.6f} | dt: {dt * 1000:.4f} ms | tokens/sec: {tps:.4f} | adam lr: {adam_lr:.6e} | muon lr: {muon_lr:.6e}"
                 )
 
             if (

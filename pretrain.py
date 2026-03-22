@@ -5,13 +5,13 @@ from src.utils.helpers import print_trainable_parameters, estimate_flops
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from typing import Any, cast
-import functools
 import os
 import wandb
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import torch.distributed as dist
+from datetime import timedelta
 
 
 # fsdp policy
@@ -23,12 +23,16 @@ def fsdp_auto_wrap_policy(module, recurse, nonwrapped_numel):
 
 @hydra.main(version_base=None, config_name="config_pretrain", config_path="config")
 def main(cfg: DictConfig):
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-
     device_obj = torch.device(f"cuda:{local_rank}")
+
+    dist.init_process_group(
+        "nccl",
+        timeout=timedelta(minutes=5),
+        device_id=device_obj,
+    )
+    rank = dist.get_rank()
+    torch.cuda.set_device(local_rank)
 
     if rank == 0:
         master_rank = True
@@ -68,6 +72,7 @@ def main(cfg: DictConfig):
         vocab_size=cfg.model.vocab_size,
         block_size=cfg.model.block_size,
         n_heads=cfg.model.n_heads,
+        n_kv_heads=cfg.model.get("n_kv_heads", cfg.model.n_heads),
         head_size=cfg.model.head_size,
         rope_head_size=cfg.model.rope_head_size,
         kv_latent_size=cfg.model.kv_latent_size,
@@ -109,6 +114,7 @@ def main(cfg: DictConfig):
         warmup_steps=cfg.training.warmup_steps,
         min_lr=cfg.training.min_lr,
         max_lr=cfg.training.max_lr,
+        muon_lr_scale=cfg.training.get("muon_lr_scale", 30.0),
         weight_decay=cfg.training.weight_decay,
         logging_steps=cfg.training.logging_steps,
         checkpoint_interval=cfg.training.checkpoint_interval,
@@ -139,6 +145,7 @@ def main(cfg: DictConfig):
     # train the model
     trainer.train(resume_from_checkpoint=resume_path)
 
+    dist.barrier()
     if master_rank:
         wandb.finish()
 

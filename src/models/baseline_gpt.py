@@ -53,7 +53,7 @@ class MLP(nn.Module):
         )  # ensures it's divisible by 256 for speed
         self.gate_proj = nn.Linear(n_embd, self.hidden_dim * 2, bias=False)
         self.down_proj = nn.Linear(self.hidden_dim, n_embd, bias=False)
-        self.down_proj.RESIDUAL_SCALE_INIT_FACOTR = True  # pyrefly: ignore
+        self.down_proj.RESIDUAL_SCALE_INIT_FACTOR = True  # pyrefly: ignore
 
     def forward(self, x):
         y, gate = torch.chunk(self.gate_proj(x), 2, dim=-1)
@@ -183,54 +183,60 @@ class GPT(nn.Module):
         return idx
 
     def configure_optimizers(self, weight_decay, learning_rate, device):
-        # Gather all params ensuring no duplicates (critical for tied weights like wte/lm_head)
-        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
-        unique_params = []
-        seen = set()
-        for p in param_dict.values():
-            if p not in seen:
+            # Gather all params ensuring no duplicates (critical for tied weights like wte/lm_head)
+            param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+            
+            muon_params = []
+            adamw_decay_params = []
+            adamw_nodecay_params = []
+            seen = set()
+            
+            for pn, p in param_dict.items():
+                if p in seen:
+                    continue
                 seen.add(p)
-                unique_params.append(p)
+                
+                # 1. Muon ONLY gets hidden 2D weights. 
+                # We explicitly exclude embeddings and the LM head.
+                if p.dim() >= 2 and "wte" not in pn and "lm_head" not in pn:
+                    muon_params.append(p)
+                # 2. AdamW gets Embeddings/Head (2D) and applies weight decay
+                elif p.dim() >= 2:
+                    adamw_decay_params.append(p)
+                # 3. AdamW gets Norms/Biases (1D) with NO weight decay
+                else:
+                    adamw_nodecay_params.append(p)
 
-        # Split into decay (2D+ tensors) and no-decay (1D tensors like biases/norms)
-        decay_params = [p for p in unique_params if p.dim() >= 2]
-        nodecay_params = [p for p in unique_params if p.dim() < 2]
+            print(f"Muon params (2D hidden): {len(muon_params)} tensors")
+            print(f"AdamW decay params (Embed/Head): {len(adamw_decay_params)} tensors")
+            print(f"AdamW no-decay params (1D norms): {len(adamw_nodecay_params)} tensors")
 
-        # optim_groups = [
-        #     {"params": decay_params, "weight_decay": weight_decay},
-        #     {"params": nodecay_params, "weight_decay": 0.0},
-        # ]
+            # Configure fused AdamW if available
+            fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and "cuda" in str(device)
+            print(f"Using fused AdamW: {use_fused}")
 
-        num_decay = sum(p.numel() for p in decay_params)
-        num_nodecay = sum(p.numel() for p in nodecay_params)
-        print(
-            f"Decayed params (2D): {len(decay_params)} tensors, {num_decay:,} parameters"
-        )
-        print(
-            f"Non-decayed params (1D): {len(nodecay_params)} tensors, {num_nodecay:,} parameters"
-        )
+            # AdamW handles the embeddings, head, and 1D parameters
+            adam_opt = torch.optim.AdamW(
+                [
+                    {"params": adamw_decay_params, "weight_decay": weight_decay},
+                    {"params": adamw_nodecay_params, "weight_decay": 0.0}
+                ],
+                lr=learning_rate, # max_lr: 2.0e-4
+                betas=(0.9, 0.95),
+                eps=1e-8,
+                fused=use_fused,
+            )
 
-        # Configure fused AdamW if available
-        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and "cuda" in str(device)
-        print(f"Using fused AdamW: {use_fused}")
+            # Muon handles the internal 2D matrices with an independent LR
+            muon_opt = Muon(
+                [{"params": muon_params}], 
+                lr=0.01,
+                momentum=0.95,
+                weight_decay=weight_decay,
+            )
 
-        # optimizer = torch.optim.AdamW(
-        #     optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
-        # )
-        # return optimizer
-
-        adam_opt = torch.optim.AdamW(
-            [{"params": nodecay_params, "weight_decay": 0.0}],
-            lr=learning_rate,
-            betas=(0.9, 0.95),
-            eps=1e-8,
-            fused=use_fused,
-        )
-
-        muon_opt = Muon([{"params": decay_params}], lr=learning_rate * 20, momentum=0.95)
-
-        return DualOptimizer(adam_opt, muon_opt)
+            return DualOptimizer(adam_opt, muon_opt)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:

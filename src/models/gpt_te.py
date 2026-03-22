@@ -8,6 +8,7 @@ import torch.distributed as dist
 import transformer_engine.pytorch as te
 import json
 import os
+import time
 
 
 class MLA(nn.Module):
@@ -108,7 +109,7 @@ class MLA(nn.Module):
 
 # Attention (Kept as fallback/reference)
 class Attention(nn.Module):
-    def __init__(self, n_embd, n_heads, dtype=None):
+    def __init__(self, n_embd, n_heads, rope_head_size, n_kv_heads=None, dtype=None):
         super().__init__()
         assert (
             n_embd % n_heads == 0
@@ -116,24 +117,55 @@ class Attention(nn.Module):
         self.n_embd = n_embd
         self.n_heads = n_heads
         self.H = n_embd // n_heads  # head size
-        self.attn = te.Linear(n_embd, 3 * n_embd, bias=False, params_dtype=dtype)
+        self.n_kv_heads = n_heads if n_kv_heads is None else n_kv_heads
+        assert (
+            n_heads % self.n_kv_heads == 0
+        ), f"n_heads ({n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})."
+        assert (
+            0 < rope_head_size <= self.H
+        ), f"rope_head_size ({rope_head_size}) must be in (0, {self.H}]."
+        assert (
+            rope_head_size % 2 == 0
+        ), f"rope_head_size ({rope_head_size}) must be even for RoPE."
+        self.rope_head_size = rope_head_size
+        kv_dim = self.n_kv_heads * self.H
+        self.attn = te.Linear(
+            n_embd, n_embd + 2 * kv_dim, bias=False, params_dtype=dtype
+        )
         self.proj = te.Linear(n_embd, n_embd, bias=False, params_dtype=dtype)
-        self.q_norm = te.RMSNorm(self.H, params_dtype=dtype)
-        self.k_norm = te.RMSNorm(self.H, params_dtype=dtype)
+        self.q_norm = nn.RMSNorm(self.H, dtype=dtype)
+        self.k_norm = nn.RMSNorm(self.H, dtype=dtype)
         self.proj.RESIDUAL_SCALE_INIT_FACTOR = True
 
+    @torch.compile
     def forward(self, x, sin, cos):
         B, T, C = x.shape
-        q, k, v = self.attn(x).split(self.n_embd, dim=-1)
+        kv_dim = self.n_kv_heads * self.H
+        q, k, v = self.attn(x).split([self.n_embd, kv_dim, kv_dim], dim=-1)
         q = q.view(B, T, self.n_heads, self.H).transpose(1, 2)
-        k = k.view(B, T, self.n_heads, self.H).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.H).transpose(1, 2)
-        # Apply RoPE
-        q = apply_rotary_emb(q, sin, cos)
-        k = apply_rotary_emb(k, sin, cos)
-        q, k = self.q_norm(q), self.k_norm(k)
+        k = k.view(B, T, self.n_kv_heads, self.H).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_heads, self.H).transpose(1, 2)
+        attn_dtype = self.q_norm.weight.dtype
+        q = q.to(attn_dtype)
+        k = k.to(attn_dtype)
+        v = v.to(attn_dtype)
 
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        q_rope, q_plain = q[..., : self.rope_head_size], q[..., self.rope_head_size :]
+        k_rope, k_plain = k[..., : self.rope_head_size], k[..., self.rope_head_size :]
+
+        q_rope = apply_rotary_emb(q_rope, sin, cos)
+        k_rope = apply_rotary_emb(k_rope, sin, cos)
+
+        q = torch.cat((q_rope, q_plain), dim=-1)
+        k = torch.cat((k_rope, k_plain), dim=-1)
+        q, k = self.q_norm(q), self.k_norm(k)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+            enable_gqa=self.n_kv_heads != self.n_heads,
+        )
 
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.proj(out)
@@ -504,6 +536,7 @@ class Block(nn.Module):
         self,
         n_embd,
         n_heads,
+        n_kv_heads,
         head_size,
         rope_head_size,
         kv_latent_size,
@@ -516,17 +549,22 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.ln1 = te.RMSNorm(n_embd, params_dtype=dtype)
-        self.sa = MLA(
+        # self.sa = MLA(
+        #     n_embd,
+        #     n_heads,
+        #     head_size,
+        #     rope_head_size,
+        #     kv_latent_size,
+        #     q_latent_size,
+        #     dtype=dtype,
+        # )
+        self.sa = Attention(
             n_embd,
             n_heads,
-            head_size,
             rope_head_size,
-            kv_latent_size,
-            q_latent_size,
+            n_kv_heads=n_kv_heads,
             dtype=dtype,
         )
-        # self.sa = Attention(n_embd, n_heads, dtype=dtype)
-        self.sa_compiled = torch.compile(self.sa)  # pyrefly:ignore
         self.ln2 = te.RMSNorm(n_embd, params_dtype=dtype)
         self.moe = ExpertParallelMoE(
             n_embd,
@@ -538,10 +576,7 @@ class Block(nn.Module):
         )
 
     def forward(self, x, sin, cos):
-        if self.training:
-            x = x + self.sa_compiled(self.ln1(x), sin, cos)
-        else:
-            x = x + self.sa(self.ln1(x), sin, cos)
+        x = x + self.sa(self.ln1(x), sin, cos)
         x = x + self.moe(self.ln2(x))
         return x
 
@@ -554,6 +589,7 @@ class GPT(nn.Module):
         vocab_size,
         block_size,
         n_heads,
+        n_kv_heads,
         head_size,
         rope_head_size,
         kv_latent_size,
@@ -580,6 +616,7 @@ class GPT(nn.Module):
                 Block(
                     n_embd,
                     n_heads,
+                    n_kv_heads,
                     head_size,
                     rope_head_size,
                     kv_latent_size,

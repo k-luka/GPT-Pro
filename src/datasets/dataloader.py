@@ -4,14 +4,19 @@ import numpy as np
 
 
 def load_tokens(filename):
-    npt = np.load(filename)
-    npt = npt.astype(np.int32)
-    ptt = torch.tensor(npt, dtype=torch.long)
-    return ptt
+    return np.load(filename, mmap_mode="r")
 
 
 class DataLoader:
-    def __init__(self, data_root, batch_size, block_size, split, rank=0, world_size=1):
+    def __init__(
+        self,
+        data_root,
+        batch_size,
+        block_size,
+        split,
+        rank=0,
+        world_size=1,
+    ):
         self.B = batch_size
         self.T = block_size
         self.rank = rank
@@ -67,7 +72,11 @@ class DataLoader:
             # Reset position: Rank 0 starts at 0, Rank 1 at B*T, etc.
             self.current_position = B * T * self.rank
 
-        buff = self.tokens[self.current_position : self.current_position + B * T + 1]
+        buff_np = np.asarray(
+            self.tokens[self.current_position : self.current_position + B * T + 1],
+            dtype=np.int32,
+        )
+        buff = torch.from_numpy(buff_np).to(torch.long)
 
         x = buff[:-1].view(B, T)
         y = buff[1:].view(B, T)
