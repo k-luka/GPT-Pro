@@ -131,9 +131,10 @@ class Trainer:
         #     if param.requires_grad and hasattr(param, "main_grad") and param.grad is None and param.main_grad is not None:
         #         param.grad = param.main_grad.to(param.dtype)
 
-        torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), 1.0
-        )  # gradient clipping
+        if hasattr(self.optimizer, "get_adamw_params"):
+            torch.nn.utils.clip_grad_norm_(self.optimizer.get_adamw_params(), 1.0)
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
         return loss_accum

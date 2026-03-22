@@ -637,29 +637,29 @@ class GPT(nn.Module):
         return idx
 
     def configure_optimizers(self, weight_decay, learning_rate, device_type):
-        decay_params = []
-        nodecay_params = []
+        from src.utils.optimizers import Muon, DualOptimizer
+
+        muon_params = []
+        adamw_decay_params = []
+        adamw_nodecay_params = []
         seen = set()
 
-        for n, p in self.named_parameters():
-            if p.requires_grad:
-                if id(p) in seen:
-                    continue
-                seen.add(id(p))
+        for pn, p in self.named_parameters():
+            if not p.requires_grad or id(p) in seen:
+                continue
+            seen.add(id(p))
 
-                if p.dim() >= 2:
-                    decay_params.append(p)
-                else:
-                    nodecay_params.append(p)
-
-        optim_groups = [
-            {"params": decay_params, "weight_decay": weight_decay},
-            {"params": nodecay_params, "weight_decay": 0.0},
-        ]
+            if p.dim() >= 2 and "wte" not in pn and "lm_head" not in pn:
+                muon_params.append(p)
+            elif p.dim() >= 2:
+                adamw_decay_params.append(p)
+            else:
+                adamw_nodecay_params.append(p)
 
         if self.rank == 0:
-            print(f"Decayed params: {sum(p.numel() for p in decay_params):,}")
-            print(f"No-decay params: {sum(p.numel() for p in nodecay_params):,}")
+            print(f"Muon params (2D hidden): {len(muon_params)} tensors, {sum(p.numel() for p in muon_params):,} parameters")
+            print(f"AdamW decay params (Embed/Head): {len(adamw_decay_params)} tensors, {sum(p.numel() for p in adamw_decay_params):,} parameters")
+            print(f"AdamW no-decay params (1D norms): {len(adamw_nodecay_params)} tensors, {sum(p.numel() for p in adamw_nodecay_params):,} parameters")
 
         use_fused = (device_type == "cuda") and (
             "fused" in inspect.signature(torch.optim.AdamW).parameters
@@ -667,9 +667,25 @@ class GPT(nn.Module):
         if self.rank == 0:
             print(f"Using fused AdamW: {use_fused}")
 
-        return torch.optim.AdamW(
-            optim_groups, lr=learning_rate, betas=(0.9, 0.95), fused=use_fused
+        adam_opt = torch.optim.AdamW(
+            [
+                {"params": adamw_decay_params, "weight_decay": weight_decay},
+                {"params": adamw_nodecay_params, "weight_decay": 0.0},
+            ],
+            lr=learning_rate,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            fused=use_fused,
         )
+
+        muon_opt = Muon(
+            [{"params": muon_params}],
+            lr=0.01,
+            momentum=0.95,
+            weight_decay=weight_decay,
+        )
+
+        return DualOptimizer(adam_opt, muon_opt)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
