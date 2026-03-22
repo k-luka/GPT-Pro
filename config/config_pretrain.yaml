@@ -7,7 +7,7 @@ experiment:
   run_name: "LM_3"
 
 model:
-  vocab_size: 50304
+  vocab_size: 151936
   block_size: 2048
   n_embd: 4096
   n_layers: 27
@@ -24,8 +24,8 @@ model:
   expert_hidden_size: 1024
 
 data:
-  train_data_root: "data/edu_fineweb350B/"
-  val_data_root: "data/edu_fineweb350B/"
+  train_data_root: "data/climbmix_400b/"
+  val_data_root: "data/climbmix_400b/"
 
 training:
   batch_size: 16

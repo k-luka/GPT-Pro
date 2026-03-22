@@ -46,10 +46,10 @@ def main(cfg: DictConfig):
             dir=os.getcwd(),
         )
 
-    # define tokenizer
-    import tiktoken
+    # define tokenizer (Qwen 3.5)
+    from transformers import AutoTokenizer
 
-    enc = tiktoken.encoding_for_model("gpt2")
+    enc = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B", trust_remote_code=True)
 
     # speed up
     torch.set_float32_matmul_precision("high")
