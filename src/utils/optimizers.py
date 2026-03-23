@@ -54,9 +54,12 @@ class DualOptimizer:
         self.muon_opt = muon_opt
         self.param_groups = adam_opt.param_groups + muon_opt.param_groups
 
-    def zero_grad(self):
-        self.adam_opt.zero_grad()
-        self.muon_opt.zero_grad()
+    def get_adamw_params(self):
+        return [p for group in self.adam_opt.param_groups for p in group["params"]]
+
+    def zero_grad(self, set_to_none=True):
+        self.adam_opt.zero_grad(set_to_none=set_to_none)
+        self.muon_opt.zero_grad(set_to_none=set_to_none)
 
     def step(self):
         self.adam_opt.step()

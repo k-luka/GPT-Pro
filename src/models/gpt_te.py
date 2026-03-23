@@ -43,8 +43,8 @@ class GQA(nn.Module):
         k = self.w_k(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.w_v(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        q = apply_rotary_emb(q, sin, cos)
-        k = apply_rotary_emb(k, sin, cos)
+        q = apply_rotary_emb(q, sin, cos).to(x.dtype)
+        k = apply_rotary_emb(k, sin, cos).to(x.dtype)
         q, k = self.q_norm(q), self.k_norm(k)
 
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
@@ -75,8 +75,8 @@ class Attention(nn.Module):
         k = k.view(B, T, self.n_heads, self.H).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.H).transpose(1, 2)
         # Apply RoPE
-        q = apply_rotary_emb(q, sin, cos)
-        k = apply_rotary_emb(k, sin, cos)
+        q = apply_rotary_emb(q, sin, cos).to(x.dtype)
+        k = apply_rotary_emb(k, sin, cos).to(x.dtype)
         q, k = self.q_norm(q), self.k_norm(k)
 
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -289,6 +289,9 @@ class ExpertParallelMoE(nn.Module):
         self.shared_experts = SharedExpert(
             n_embd, hidden_size=n_shared_experts * expert_hidden_size, dtype=dtype
         )
+        self.shared_experts_compiled = torch.compile(
+            self.shared_experts
+        )  # pyrefly:ignore
 
         # 2. Local Experts: Size is reduced to (Total / World_Size)
         self.routed_fused_proj = te.GroupedLinear(
@@ -322,7 +325,10 @@ class ExpertParallelMoE(nn.Module):
         x_flat = x.view(-1, C)
 
         # Shared experts
-        shared = self.shared_experts(x)
+        if self.training:
+            shared = self.shared_experts_compiled(x)
+        else:
+            shared = self.shared_experts(x)
 
         # Routing (Global)
         topk_idx, weights = self.gate(x_flat)
@@ -644,7 +650,7 @@ class GPT(nn.Module):
         return idx
 
     def configure_optimizers(self, weight_decay, learning_rate, device_type):
-        from src.utils.optimizers import Muon, DualOptimizer
+        from src.utils.optimizers import DualOptimizer
 
         muon_params = []
         adamw_decay_params = []
@@ -691,11 +697,13 @@ class GPT(nn.Module):
             fused=use_fused,
         )
 
-        muon_opt = Muon(
-            [{"params": muon_params}],
-            lr=0.01,
-            momentum=0.95,
+        muon_opt = torch.optim.Muon(
+            muon_params,
+            lr=learning_rate,
             weight_decay=weight_decay,
+            momentum=0.95,
+            nesterov=True,
+            adjust_lr_fn="match_rms_adamw",
         )
 
         return DualOptimizer(adam_opt, muon_opt)

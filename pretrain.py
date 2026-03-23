@@ -1,3 +1,5 @@
+import sys
+import traceback
 import torch
 from src.models.gpt_te import GPT, Block
 from src.training.trainer_te import Trainer, TrainerConfig
@@ -40,6 +42,17 @@ def main(cfg: DictConfig):
     else:
         master_rank = False
 
+    try:
+        _run_training(cfg, device_obj, master_rank)
+    except Exception:
+        if master_rank:
+            traceback.print_exc()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        sys.exit(1)
+
+
+def _run_training(cfg: DictConfig, device_obj: torch.device, master_rank: bool):
     # init wandb
     wandb_run = None
     if master_rank:
@@ -112,7 +125,6 @@ def main(cfg: DictConfig):
         warmup_steps=cfg.training.warmup_steps,
         min_lr=cfg.training.min_lr,
         max_lr=cfg.training.max_lr,
-        muon_lr_scale=cfg.training.get("muon_lr_scale", 30.0),
         weight_decay=cfg.training.weight_decay,
         logging_steps=cfg.training.logging_steps,
         checkpoint_interval=cfg.training.checkpoint_interval,

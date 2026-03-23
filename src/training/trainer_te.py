@@ -179,7 +179,6 @@ class Trainer:
         for step in range(start_step, self.config.max_steps + 1):
             self.step = step
             t0 = time.time()
-            # set the learning_rate
             lr = self.get_lr(step)
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = lr

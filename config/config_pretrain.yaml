@@ -3,20 +3,20 @@ hydra:
     dir: output/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 experiment:
-  project: "GPT_Pro"
+  project: "GPT_Max"
   run_name: "LM_Neo"
 
 model:
   vocab_size: 129024  # DeepSeek V3 vocab size is 128815, padded to multiple of 256 for tensor cores
-  block_size: 2048
+  block_size: 4096
   n_embd: 4096
-  n_layers: 32
+  n_layers: 24
   n_heads: 32
   n_kv_heads: 8
   
   # MoE Settings
   n_shared_experts: 2
-  n_routed_experts: 40
+  n_routed_experts: 32
   topk_experts: 8
   expert_hidden_size: 1024
 
@@ -25,7 +25,7 @@ data:
   val_data_root: "data/climbmix_400b/"
 
 training:
-  batch_size: 16
+  batch_size: 8
   grad_accum_steps: 8
 
   # Logistics
@@ -42,7 +42,6 @@ training:
   warmup_steps: 2000
   max_lr: 2.0e-4
   min_lr: 2.0e-5
-  muon_lr_scale: 30.0
   weight_decay: 0.1
   
 # resume_checkpoint: output/checkpoints/LM_2/best_val
