@@ -53,7 +53,9 @@ def main(cfg: DictConfig):
     # define tokenizer
     from transformers import AutoTokenizer
 
-    enc = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V3-Base", trust_remote_code=True)
+    enc = AutoTokenizer.from_pretrained(
+        "deepseek-ai/DeepSeek-V3-Base", trust_remote_code=True
+    )
 
     # speed up
     torch.set_float32_matmul_precision("high")

@@ -28,7 +28,9 @@ class DataLoader:
             s for s in os.listdir(data_root) if split in s and s.endswith(".bin")
         )
         self.shards = [os.path.join(data_root, s) for s in shards]
-        assert len(self.shards) > 0, f"no .bin shards found for split '{split}' in {data_root}"
+        assert (
+            len(self.shards) > 0
+        ), f"no .bin shards found for split '{split}' in {data_root}"
 
         self.reset()
 

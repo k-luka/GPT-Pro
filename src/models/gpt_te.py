@@ -19,10 +19,18 @@ class GQA(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.head_dim = n_embd // n_heads
 
-        self.w_q = te.Linear(n_embd, n_heads * self.head_dim, bias=False, params_dtype=dtype)
-        self.w_k = te.Linear(n_embd, n_kv_heads * self.head_dim, bias=False, params_dtype=dtype)
-        self.w_v = te.Linear(n_embd, n_kv_heads * self.head_dim, bias=False, params_dtype=dtype)
-        self.proj = te.Linear(n_heads * self.head_dim, n_embd, bias=False, params_dtype=dtype)
+        self.w_q = te.Linear(
+            n_embd, n_heads * self.head_dim, bias=False, params_dtype=dtype
+        )
+        self.w_k = te.Linear(
+            n_embd, n_kv_heads * self.head_dim, bias=False, params_dtype=dtype
+        )
+        self.w_v = te.Linear(
+            n_embd, n_kv_heads * self.head_dim, bias=False, params_dtype=dtype
+        )
+        self.proj = te.Linear(
+            n_heads * self.head_dim, n_embd, bias=False, params_dtype=dtype
+        )
         self.proj.RESIDUAL_SCALE_INIT_FACTOR = True
 
         self.q_norm = nn.RMSNorm(self.head_dim, dtype=dtype)
@@ -39,8 +47,7 @@ class GQA(nn.Module):
         k = apply_rotary_emb(k, sin, cos)
         q, k = self.q_norm(q), self.k_norm(k)
 
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.proj(out)
 
@@ -657,9 +664,15 @@ class GPT(nn.Module):
                 adamw_nodecay_params.append(p)
 
         if self.rank == 0:
-            print(f"Muon params (2D hidden): {len(muon_params)} tensors, {sum(p.numel() for p in muon_params):,} parameters")
-            print(f"AdamW decay params (Embed/Head): {len(adamw_decay_params)} tensors, {sum(p.numel() for p in adamw_decay_params):,} parameters")
-            print(f"AdamW no-decay params (1D norms): {len(adamw_nodecay_params)} tensors, {sum(p.numel() for p in adamw_nodecay_params):,} parameters")
+            print(
+                f"Muon params (2D hidden): {len(muon_params)} tensors, {sum(p.numel() for p in muon_params):,} parameters"
+            )
+            print(
+                f"AdamW decay params (Embed/Head): {len(adamw_decay_params)} tensors, {sum(p.numel() for p in adamw_decay_params):,} parameters"
+            )
+            print(
+                f"AdamW no-decay params (1D norms): {len(adamw_nodecay_params)} tensors, {sum(p.numel() for p in adamw_nodecay_params):,} parameters"
+            )
 
         use_fused = (device_type == "cuda") and (
             "fused" in inspect.signature(torch.optim.AdamW).parameters

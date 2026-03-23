@@ -67,7 +67,9 @@ def print_trainable_parameters(cfg, model):
 
     print("| --------------------------------------------------------------------")
     print(f"| Config: {cfg.experiment.run_name}")
-    print(f"| Architecture: {n_layers} layers, {n_heads} heads ({n_kv_heads} KV), {n_embd} dim")
+    print(
+        f"| Architecture: {n_layers} layers, {n_heads} heads ({n_kv_heads} KV), {n_embd} dim"
+    )
     print(
         f"| Experts: {n_routed} routed, {cfg.model.get('n_shared_experts', 0)} shared, TopK: {topk}"
     )

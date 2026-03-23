@@ -88,10 +88,18 @@ def main() -> None:
     parser.add_argument("--output_dir", type=str, default="data/climbmix_400b")
     parser.add_argument("--tokenizer", type=str, default=TOKENIZER_NAME)
     parser.add_argument("--dataset", type=str, default=DATASET_NAME)
-    parser.add_argument("--val_shards", type=int, default=1,
-                        help="Number of leading shards reserved for validation")
-    parser.add_argument("--num_workers", type=int, default=0,
-                        help="Tokenization workers (0 = use all CPUs)")
+    parser.add_argument(
+        "--val_shards",
+        type=int,
+        default=1,
+        help="Number of leading shards reserved for validation",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="Tokenization workers (0 = use all CPUs)",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -139,7 +147,12 @@ def main() -> None:
 
                     split = "val" if shard_idx < args.val_shards else "train"
                     leftover = _write_shard(
-                        args.output_dir, split, shard_idx, buf, token_count, args.block_size
+                        args.output_dir,
+                        split,
+                        shard_idx,
+                        buf,
+                        token_count,
+                        args.block_size,
                     )
 
                     # carry leftover tokens into the next shard buffer
@@ -153,7 +166,9 @@ def main() -> None:
         if progress is not None:
             progress.close()
         split = "val" if shard_idx < args.val_shards else "train"
-        _write_shard(args.output_dir, split, shard_idx, buf, token_count, args.block_size)
+        _write_shard(
+            args.output_dir, split, shard_idx, buf, token_count, args.block_size
+        )
 
     print("\nDone.")
 
