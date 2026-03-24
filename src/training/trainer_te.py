@@ -18,6 +18,7 @@ class TrainerConfig:
     run_name: str = "test1"
     batch_size: int = 64
     grad_accum_steps: int = 4
+    batch_warmup_steps: int = 0
     block_size: int = 1024
     max_steps: int = 1000
     warmup_steps: int = 100
@@ -89,6 +90,13 @@ class Trainer:
         #     if param.requires_grad:
         #         param.main_grad = torch.zeros_like(param, dtype=torch.float32)
 
+    def get_grad_accum_steps(self, step):
+        target = self.config.grad_accum_steps
+        if self.config.batch_warmup_steps <= 0 or step >= self.config.batch_warmup_steps:
+            return target
+        frac = step / self.config.batch_warmup_steps
+        return max(1, round(1 + frac * (target - 1)))
+
     def get_lr(self, it):
         if it < self.config.warmup_steps:
             return self.config.max_lr * it / self.config.warmup_steps
@@ -101,24 +109,18 @@ class Trainer:
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return self.config.min_lr + coeff * (self.config.max_lr - self.config.min_lr)
 
-    def _train_global_batch(self):
+    def _train_global_batch(self, grad_accum_steps):
         self.optimizer.zero_grad()
         loss_accum = 0.0
 
-        # for param in self.model.parameters():
-        #     if param.requires_grad and hasattr(param, "main_grad"):
-        #         param.main_grad.zero_()
-
-        for step in range(self.config.grad_accum_steps):
+        for step in range(grad_accum_steps):
             x, y = next(self.train_loader)
             x, y = x.to(self.config.device), y.to(self.config.device)
             torch.compiler.cudagraph_mark_step_begin()
             with torch.autocast(device_type=self.config.device, dtype=torch.bfloat16):
                 with te.autocast(enabled=True, recipe=self.fp8_recipe):
                     _, loss = self.model(x, y)
-            loss = (
-                loss / self.config.grad_accum_steps
-            )  # scale loss as otherwise it would accumulate
+            loss = loss / grad_accum_steps
             loss_accum += loss.detach()
             loss.backward()
             # # Accumulate the grad in float32
@@ -182,14 +184,15 @@ class Trainer:
             lr = self.get_lr(step)
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = lr
-            loss = self._train_global_batch()
+            current_accum = self.get_grad_accum_steps(step)
+            loss = self._train_global_batch(current_accum)
             torch.cuda.synchronize()
             t1 = time.time()
             dt = t1 - t0
             tps = (
                 self.train_loader.B
                 * self.train_loader.T
-                * self.config.grad_accum_steps
+                * current_accum
                 * self.world_size
             ) / dt
 

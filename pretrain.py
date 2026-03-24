@@ -121,6 +121,7 @@ def _run_training(cfg: DictConfig, device_obj: torch.device, master_rank: bool):
         batch_size=cfg.training.batch_size,
         block_size=cfg.model.block_size,
         grad_accum_steps=cfg.training.grad_accum_steps,
+        batch_warmup_steps=cfg.training.get("batch_warmup_steps", 0),
         max_steps=cfg.training.max_steps,
         warmup_steps=cfg.training.warmup_steps,
         min_lr=cfg.training.min_lr,
