@@ -1,3 +1,4 @@
+import contextlib
 import torch
 from dataclasses import dataclass
 from src.datasets.dataloader import DataLoader
@@ -83,12 +84,6 @@ class Trainer:
         self.fp8_recipe = DelayedScaling(
             fp8_format=self.fp8_format, amax_history_len=16, amax_compute_algo="max"
         )
-        # # The model is in bf16 so gradients are calculated in bf16.
-        # # This is fine but I have high grad accumulation steps which means the accumulated grad can overflow
-        # # So I calculate in bf16 but accumulate in float32
-        # for param in self.model.parameters():
-        #     if param.requires_grad:
-        #         param.main_grad = torch.zeros_like(param, dtype=torch.float32)
 
     def get_grad_accum_steps(self, step):
         target = self.config.grad_accum_steps
@@ -110,28 +105,42 @@ class Trainer:
         return self.config.min_lr + coeff * (self.config.max_lr - self.config.min_lr)
 
     def _train_global_batch(self, grad_accum_steps):
-        self.optimizer.zero_grad()
+        # zero_grad with set_to_none=True, then pre-allocate FP32 gradient buffers.
+        # When param.grad is a pre-existing FP32 tensor, PyTorch's autograd upcasts
+        # BF16 computed gradients to FP32 before accumulating — giving us full-precision
+        # gradient accumulation across microbatches without any manual casting.
+        self.optimizer.zero_grad(set_to_none=True)
+        for param in self.model.parameters():
+            if param.requires_grad:
+                param.grad = torch.zeros_like(param, dtype=torch.float32)
+
         loss_accum = 0.0
 
-        for step in range(grad_accum_steps):
+        for micro_step in range(grad_accum_steps):
             x, y = next(self.train_loader)
             x, y = x.to(self.config.device), y.to(self.config.device)
-            torch.compiler.cudagraph_mark_step_begin()
-            with torch.autocast(device_type=self.config.device, dtype=torch.bfloat16):
-                with te.autocast(enabled=True, recipe=self.fp8_recipe):
-                    _, loss = self.model(x, y)
-            loss = loss / grad_accum_steps
-            loss_accum += loss.detach()
-            loss.backward()
-            # # Accumulate the grad in float32
-            # for param in self.model.parameters():
-            #     if param.requires_grad and hasattr(param, "main_grad") and param.main_grad is not None and param.grad is not None:
-            #         param.main_grad.add_(param.grad.float())
-            #         param.grad = None
+            is_last = micro_step == grad_accum_steps - 1
 
-        # for param in self.model.parameters():
-        #     if param.requires_grad and hasattr(param, "main_grad") and param.grad is None and param.main_grad is not None:
-        #         param.grad = param.main_grad.to(param.dtype)
+            torch.compiler.cudagraph_mark_step_begin()
+
+            # Skip FSDP gradient sync for all but the last microbatch — the last
+            # backward triggers a single all-reduce over the fully-accumulated FP32 grad.
+            ctx = contextlib.nullcontext() if is_last else self.model.no_sync()
+            with ctx:
+                with torch.autocast(device_type=self.config.device, dtype=torch.bfloat16):
+                    with te.autocast(
+                        enabled=True,
+                        recipe=self.fp8_recipe,
+                        fp8_group=dist.group.WORLD,
+                    ):
+                        # is_first_microbatch=True on the first step lets TE cache the
+                        # FP8-cast weights for reuse across all gradient accumulation steps.
+                        _, loss = self.model(
+                            x, y, is_first_microbatch=(micro_step == 0)
+                        )
+                loss = loss / grad_accum_steps
+                loss_accum += loss.detach()
+                loss.backward()
 
         if hasattr(self.optimizer, "get_adamw_params"):
             torch.nn.utils.clip_grad_norm_(self.optimizer.get_adamw_params(), 1.0)

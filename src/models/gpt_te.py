@@ -36,12 +36,12 @@ class GQA(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim, dtype=dtype)
         self.k_norm = nn.RMSNorm(self.head_dim, dtype=dtype)
 
-    def forward(self, x, sin, cos):
+    def forward(self, x, sin, cos, is_first_microbatch=None):
         B, T, _ = x.shape
 
-        q = self.w_q(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.w_k(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.w_v(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.w_q(x, is_first_microbatch=is_first_microbatch).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.w_k(x, is_first_microbatch=is_first_microbatch).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.w_v(x, is_first_microbatch=is_first_microbatch).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         q = apply_rotary_emb(q, sin, cos).to(x.dtype)
         k = apply_rotary_emb(k, sin, cos).to(x.dtype)
@@ -49,7 +49,7 @@ class GQA(nn.Module):
 
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
-        return self.proj(out)
+        return self.proj(out, is_first_microbatch=is_first_microbatch)
 
 
 # Attention (Kept as fallback/reference)
@@ -130,10 +130,10 @@ class SharedExpert(nn.Module):
         )
         self.down_proj.RESIDUAL_SCALE_INIT_FACTOR = True
 
-    def forward(self, x):
-        gate = F.silu(self.gate_proj(x))
-        x = gate * self.up_proj(x)
-        return self.down_proj(x)
+    def forward(self, x, is_first_microbatch=None):
+        gate = F.silu(self.gate_proj(x, is_first_microbatch=is_first_microbatch))
+        x = gate * self.up_proj(x, is_first_microbatch=is_first_microbatch)
+        return self.down_proj(x, is_first_microbatch=is_first_microbatch)
 
 
 # Decides which experts will be used
@@ -214,10 +214,10 @@ class MoE(nn.Module):
             correction = torch.sign(target_load - actual_load)
             self.gate.bias.add_(update_rate * correction)  # pyrefly: ignore
 
-    def forward(self, x):
+    def forward(self, x, is_first_microbatch=None):
         B, T, C = x.shape
         x_flat = x.view(-1, C)
-        shared = self.shared_experts(x)
+        shared = self.shared_experts(x, is_first_microbatch=is_first_microbatch)
 
         topk_idx, weights = self.gate(x_flat)
 
@@ -241,11 +241,13 @@ class MoE(nn.Module):
             self.update_bias(tokens_per_expert)
 
         routed_up_proj, routed_gate = self.routed_fused_proj(
-            permuted_x, m_splits=local_tokens_per_expert_list
+            permuted_x, m_splits=local_tokens_per_expert_list,
+            is_first_microbatch=is_first_microbatch,
         ).chunk(2, dim=-1)
         permuted_up_x = routed_up_proj * F.silu(routed_gate)
         permuted_y = self.routed_down_proj(
-            permuted_up_x, m_splits=local_tokens_per_expert_list
+            permuted_up_x, m_splits=local_tokens_per_expert_list,
+            is_first_microbatch=is_first_microbatch,
         )
 
         routed = te.moe_unpermute(
@@ -320,15 +322,15 @@ class ExpertParallelMoE(nn.Module):
             correction = torch.sign(target_load - actual_load)
             self.gate.bias.add_(update_rate * correction)  # pyrefly: ignore
 
-    def forward(self, x):
+    def forward(self, x, is_first_microbatch=None):
         B, T, C = x.shape
         x_flat = x.view(-1, C)
 
         # Shared experts
         if self.training:
-            shared = self.shared_experts_compiled(x)
+            shared = self.shared_experts_compiled(x, is_first_microbatch=is_first_microbatch)
         else:
-            shared = self.shared_experts(x)
+            shared = self.shared_experts(x, is_first_microbatch=is_first_microbatch)
 
         # Routing (Global)
         topk_idx, weights = self.gate(x_flat)
@@ -407,12 +409,18 @@ class ExpertParallelMoE(nn.Module):
         ).tolist()
 
         # Forward Pass through Experts
-        up = self.routed_fused_proj(recv_x_te, m_splits=tokens_per_local_expert)
+        up = self.routed_fused_proj(
+            recv_x_te, m_splits=tokens_per_local_expert,
+            is_first_microbatch=is_first_microbatch,
+        )
         gate = up.chunk(2, dim=-1)[1]
         up = up.chunk(2, dim=-1)[0]
 
         h = up * F.silu(gate)
-        out_te = self.routed_down_proj(h, m_splits=tokens_per_local_expert)
+        out_te = self.routed_down_proj(
+            h, m_splits=tokens_per_local_expert,
+            is_first_microbatch=is_first_microbatch,
+        )
 
         # Apply routing weights
         out_te = out_te * recv_weights[te_sort_idx].unsqueeze(-1)
@@ -477,12 +485,12 @@ class Block(nn.Module):
             dtype=dtype,
         )
 
-    def forward(self, x, sin, cos):
+    def forward(self, x, sin, cos, is_first_microbatch=None):
         if self.training:
-            x = x + self.sa_compiled(self.ln1(x), sin, cos)
+            x = x + self.sa_compiled(self.ln1(x), sin, cos, is_first_microbatch=is_first_microbatch)
         else:
-            x = x + self.sa(self.ln1(x), sin, cos)
-        x = x + self.moe(self.ln2(x))
+            x = x + self.sa(self.ln1(x), sin, cos, is_first_microbatch=is_first_microbatch)
+        x = x + self.moe(self.ln2(x), is_first_microbatch=is_first_microbatch)
         return x
 
 
@@ -597,7 +605,7 @@ class GPT(nn.Module):
             if hasattr(module, "bias") and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)  # pyrefly: ignore
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, is_first_microbatch=None):
         B, T = idx.shape
         assert (
             T <= self.block_size
@@ -607,7 +615,7 @@ class GPT(nn.Module):
         cos = self.cos[:, :, :T, :]  # pyrefly: ignore
 
         for block in self.transformer:
-            x = block(x, sin, cos)
+            x = block(x, sin, cos, is_first_microbatch=is_first_microbatch)
         x = self.ln(x)
 
         if self.training:
