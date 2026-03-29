@@ -1,53 +1,6 @@
 import torch
 
 
-@torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic polynomial instead of the standard cubic polynomial in order to converge 1.5x faster.
-    """
-    assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    X /= X.norm() + eps  # ensure top singular value <= 1
-    if G.size(0) > G.size(1):
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-    if G.size(0) > G.size(1):
-        X = X.T
-    return X
-
-
-class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=1e-3, momentum=0.95):
-        defaults = dict(lr=lr, momentum=momentum)
-        super().__init__(params, defaults)
-
-    def step(self):
-        for group in self.param_groups:
-            lr = group["lr"]
-            momentum = group["momentum"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                g = p.grad
-                if g.ndim > 2:
-                    g = g.view(g.size(0), -1)
-                assert g.ndim == 2, "Muon only supports 2D params"
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                g = zeropower_via_newtonschulz5(buf)
-                g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                p.data.add_(g, alpha=-lr)
-
-
 class DualOptimizer:
     def __init__(self, adam_opt, muon_opt):
         self.adam_opt = adam_opt

@@ -131,7 +131,7 @@ class Trainer:
                     with te.autocast(
                         enabled=True,
                         recipe=self.fp8_recipe,
-                        fp8_group=dist.group.WORLD,
+                        fp8_group=dist.group.WORLD, # pyrefly: ignore
                     ):
                         # is_first_microbatch=True on the first step lets TE cache the
                         # FP8-cast weights for reuse across all gradient accumulation steps.
