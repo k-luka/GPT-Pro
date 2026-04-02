@@ -50,9 +50,7 @@ def masked_ce_loss(
 ):
     bsz, seq_len, vocab = logits.shape
     losses = F.cross_entropy(
-        logits.view(bsz * seq_len, vocab),
-        targets.view(bsz * seq_len),
-        reduction="none",
+        logits.view(bsz * seq_len, vocab), targets.view(bsz * seq_len), reduction="none"
     ).view(bsz, seq_len)
 
     mask = loss_mask.float()
@@ -153,10 +151,7 @@ def evaluate(model, val_data, cfg: DictConfig, device: torch.device):
 
     for _ in range(cfg.training.eval_steps):
         x, y, loss_mask = sample_batch(
-            val_data,
-            cfg.training.eval_batch_size,
-            cfg.model.block_size,
-            device,
+            val_data, cfg.training.eval_batch_size, cfg.model.block_size, device
         )
         with torch.autocast(
             device_type=device.type,
@@ -247,10 +242,7 @@ def main(cfg: DictConfig):
 
         for _ in range(cfg.training.grad_accum_steps):
             x, y, loss_mask = sample_batch(
-                train_data,
-                cfg.training.batch_size,
-                cfg.model.block_size,
-                device,
+                train_data, cfg.training.batch_size, cfg.model.block_size, device
             )
             with torch.autocast(
                 device_type=device.type,
@@ -304,11 +296,7 @@ def main(cfg: DictConfig):
 
             if master_rank and wandb_run is not None:
                 wandb_run.log(
-                    {
-                        "val/loss": val_loss,
-                        "val/best_loss": best_val_loss,
-                    },
-                    step=step,
+                    {"val/loss": val_loss, "val/best_loss": best_val_loss}, step=step
                 )
 
             save_sft_checkpoint(

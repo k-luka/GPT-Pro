@@ -39,9 +39,21 @@ class GQA(nn.Module):
     def forward(self, x, sin, cos, is_first_microbatch=None):
         B, T, _ = x.shape
 
-        q = self.w_q(x, is_first_microbatch=is_first_microbatch).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.w_k(x, is_first_microbatch=is_first_microbatch).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.w_v(x, is_first_microbatch=is_first_microbatch).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.w_q(x, is_first_microbatch=is_first_microbatch)
+            .view(B, T, self.n_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.w_k(x, is_first_microbatch=is_first_microbatch)
+            .view(B, T, self.n_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.w_v(x, is_first_microbatch=is_first_microbatch)
+            .view(B, T, self.n_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
 
         q = apply_rotary_emb(q, sin, cos).to(x.dtype)
         k = apply_rotary_emb(k, sin, cos).to(x.dtype)
@@ -241,12 +253,14 @@ class MoE(nn.Module):
             self.update_bias(tokens_per_expert)
 
         routed_up_proj, routed_gate = self.routed_fused_proj(
-            permuted_x, m_splits=local_tokens_per_expert_list,
+            permuted_x,
+            m_splits=local_tokens_per_expert_list,
             is_first_microbatch=is_first_microbatch,
         ).chunk(2, dim=-1)
         permuted_up_x = routed_up_proj * F.silu(routed_gate)
         permuted_y = self.routed_down_proj(
-            permuted_up_x, m_splits=local_tokens_per_expert_list,
+            permuted_up_x,
+            m_splits=local_tokens_per_expert_list,
             is_first_microbatch=is_first_microbatch,
         )
 
@@ -328,7 +342,9 @@ class ExpertParallelMoE(nn.Module):
 
         # Shared experts
         if self.training:
-            shared = self.shared_experts_compiled(x, is_first_microbatch=is_first_microbatch)
+            shared = self.shared_experts_compiled(
+                x, is_first_microbatch=is_first_microbatch
+            )
         else:
             shared = self.shared_experts(x, is_first_microbatch=is_first_microbatch)
 
@@ -410,7 +426,8 @@ class ExpertParallelMoE(nn.Module):
 
         # Forward Pass through Experts
         up = self.routed_fused_proj(
-            recv_x_te, m_splits=tokens_per_local_expert,
+            recv_x_te,
+            m_splits=tokens_per_local_expert,
             is_first_microbatch=is_first_microbatch,
         )
         gate = up.chunk(2, dim=-1)[1]
@@ -418,8 +435,7 @@ class ExpertParallelMoE(nn.Module):
 
         h = up * F.silu(gate)
         out_te = self.routed_down_proj(
-            h, m_splits=tokens_per_local_expert,
-            is_first_microbatch=is_first_microbatch,
+            h, m_splits=tokens_per_local_expert, is_first_microbatch=is_first_microbatch
         )
 
         # Apply routing weights
@@ -487,9 +503,13 @@ class Block(nn.Module):
 
     def forward(self, x, sin, cos, is_first_microbatch=None):
         if self.training:
-            x = x + self.sa_compiled(self.ln1(x), sin, cos, is_first_microbatch=is_first_microbatch)
+            x = x + self.sa_compiled(
+                self.ln1(x), sin, cos, is_first_microbatch=is_first_microbatch
+            )
         else:
-            x = x + self.sa(self.ln1(x), sin, cos, is_first_microbatch=is_first_microbatch)
+            x = x + self.sa(
+                self.ln1(x), sin, cos, is_first_microbatch=is_first_microbatch
+            )
         x = x + self.moe(self.ln2(x), is_first_microbatch=is_first_microbatch)
         return x
 

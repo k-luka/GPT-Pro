@@ -1,9 +1,8 @@
 output/
 data/
 wandb/
-src/__pycache__
-src/te_versions/__pycache__
-data_preprocessing/__pycache__
+__pycache__/
+*.pyc
 run.sh
 pyrefly.toml
 src/model_practice.py

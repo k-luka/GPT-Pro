@@ -69,9 +69,7 @@ class Trainer:
         )
 
         self.optimizer = self.model.configure_optimizers(
-            self.config.weight_decay,
-            self.config.learning_rate,
-            self.config.device,
+            self.config.weight_decay, self.config.learning_rate, self.config.device
         )
         self.tokenizer = tokenizer
         self.step = 0

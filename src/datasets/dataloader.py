@@ -78,4 +78,4 @@ class DataLoader:
         y = buf[1:].view(B, T)
 
         self.current_position += B * T * self.world_size
-        return x, y
+        return x.pin_memory(), y.pin_memory()

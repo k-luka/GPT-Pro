@@ -4,20 +4,20 @@ hydra:
 
 experiment:
   project: "GPT_Max"
-  run_name: "LM_Neo_5B"
+  run_name: "LM_Neo"
 
 model:
   vocab_size: 129024  # DeepSeek V3 vocab size is 128815, padded to multiple of 256 for tensor cores
   block_size: 4096
-  n_embd: 3072
+  n_embd: 4096
   n_layers: 24
-  n_heads: 24
+  n_heads: 32
   n_kv_heads: 8
-
+  
   # MoE Settings
   n_shared_experts: 2
-  n_routed_experts: 16
-  topk_experts: 4
+  n_routed_experts: 24
+  topk_experts: 8
   expert_hidden_size: 1024
 
 data:
@@ -30,19 +30,19 @@ training:
   batch_warmup_steps: 1000
 
   # Logistics
-  logging_steps: 20
-  checkpoint_interval: 5000
+  logging_steps: 1
+  checkpoint_interval: 8000
   generation_interval: 10000000
-  eval_interval: 1000
+  eval_interval: 400
   eval_steps: 80
   eval_batch_size: 16
   eval_block_size: 2048
-
+  
   # Optimization
-  max_steps: 52000
-  warmup_steps: 1000
+  max_steps: 160000
+  warmup_steps: 2000
   max_lr: 2.0e-4
   min_lr: 2.0e-5
   weight_decay: 0.1
-
-# resume_checkpoint: output/checkpoints/LM_Neo_5B/best_val
+  
+# resume_checkpoint: output/checkpoints/LM_2/best_val

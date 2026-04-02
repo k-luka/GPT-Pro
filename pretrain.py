@@ -28,11 +28,7 @@ def main(cfg: DictConfig):
     local_rank = int(os.environ["LOCAL_RANK"])
     device_obj = torch.device(f"cuda:{local_rank}")
 
-    dist.init_process_group(
-        "nccl",
-        timeout=timedelta(minutes=5),
-        device_id=device_obj,
-    )
+    dist.init_process_group("nccl", timeout=timedelta(minutes=5), device_id=device_obj)
     rank = dist.get_rank()
     torch.cuda.set_device(local_rank)
 
@@ -45,8 +41,7 @@ def main(cfg: DictConfig):
     try:
         _run_training(cfg, device_obj, master_rank)
     except Exception:
-        if master_rank:
-            traceback.print_exc()
+        traceback.print_exc()
         if dist.is_initialized():
             dist.destroy_process_group()
         sys.exit(1)

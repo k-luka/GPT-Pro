@@ -73,12 +73,12 @@ class Trainer:
         )
 
         self.optimizer = self.model.configure_optimizers(
-            self.config.weight_decay,
-            self.config.learning_rate,
-            self.config.device,
+            self.config.weight_decay, self.config.max_lr, self.config.device
         )
         self.tokenizer = tokenizer
         self.step = 0
+        self._prefetch_stream = torch.cuda.Stream()
+        self._prefetched = None
 
         self.fp8_format = Format.HYBRID
         self.fp8_recipe = DelayedScaling(
@@ -87,7 +87,10 @@ class Trainer:
 
     def get_grad_accum_steps(self, step):
         target = self.config.grad_accum_steps
-        if self.config.batch_warmup_steps <= 0 or step >= self.config.batch_warmup_steps:
+        if (
+            self.config.batch_warmup_steps <= 0
+            or step >= self.config.batch_warmup_steps
+        ):
             return target
         frac = step / self.config.batch_warmup_steps
         return max(1, round(1 + frac * (target - 1)))
@@ -104,22 +107,34 @@ class Trainer:
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return self.config.min_lr + coeff * (self.config.max_lr - self.config.min_lr)
 
-    def _train_global_batch(self, grad_accum_steps):
-        # zero_grad with set_to_none=True, then pre-allocate FP32 gradient buffers.
-        # When param.grad is a pre-existing FP32 tensor, PyTorch's autograd upcasts
-        # BF16 computed gradients to FP32 before accumulating — giving us full-precision
-        # gradient accumulation across microbatches without any manual casting.
-        self.optimizer.zero_grad(set_to_none=True)
-        for param in self.model.parameters():
-            if param.requires_grad:
-                param.grad = torch.zeros_like(param, dtype=torch.float32)
+    def _prefetch(self):
+        """Prefetch next batch to GPU on a separate CUDA stream."""
+        x, y = next(self.train_loader)
+        with torch.cuda.stream(self._prefetch_stream):
+            self._prefetched = (
+                x.to(self.config.device, non_blocking=True),
+                y.to(self.config.device, non_blocking=True),
+            )
 
+    def _get_prefetched(self):
+        """Wait for prefetch to complete and return the batch."""
+        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        return self._prefetched
+
+    def _train_global_batch(self, grad_accum_steps):
+        self.optimizer.zero_grad()
         loss_accum = 0.0
 
+        # Kick off first prefetch
+        self._prefetch()
+
         for micro_step in range(grad_accum_steps):
-            x, y = next(self.train_loader)
-            x, y = x.to(self.config.device), y.to(self.config.device)
+            x, y = self._get_prefetched()
             is_last = micro_step == grad_accum_steps - 1
+
+            # Start prefetching the next microbatch while compute runs
+            if not is_last:
+                self._prefetch()
 
             torch.compiler.cudagraph_mark_step_begin()
 
@@ -127,11 +142,13 @@ class Trainer:
             # backward triggers a single all-reduce over the fully-accumulated FP32 grad.
             ctx = contextlib.nullcontext() if is_last else self.model.no_sync()
             with ctx:
-                with torch.autocast(device_type=self.config.device, dtype=torch.bfloat16):
+                with torch.autocast(
+                    device_type=self.config.device, dtype=torch.bfloat16
+                ):
                     with te.autocast(
                         enabled=True,
                         recipe=self.fp8_recipe,
-                        fp8_group=dist.group.WORLD, # pyrefly: ignore
+                        amax_reduction_group=dist.group.WORLD,
                     ):
                         # is_first_microbatch=True on the first step lets TE cache the
                         # FP8-cast weights for reuse across all gradient accumulation steps.
