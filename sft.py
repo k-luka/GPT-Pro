@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import wandb
 from omegaconf import DictConfig, OmegaConf
 
-from src.models.gpt_te import GPT
+from src.models.gpt_moe import GPT
 
 
 def load_sft_data(file_path: str):

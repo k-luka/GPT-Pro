@@ -1,8 +1,8 @@
 import sys
 import traceback
 import torch
-from src.models.gpt_te import GPT, Block
-from src.training.trainer_te import Trainer, TrainerConfig
+from src.models.gpt_moe import GPT, Block
+from src.training.trainer_moe import Trainer, TrainerConfig
 from src.utils.helpers import print_trainable_parameters, estimate_flops
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -23,7 +23,7 @@ def fsdp_auto_wrap_policy(module, recurse, nonwrapped_numel):
     )
 
 
-@hydra.main(version_base=None, config_name="config_pretrain", config_path="config")
+@hydra.main(version_base=None, config_name="config_moe", config_path="config")
 def main(cfg: DictConfig):
     local_rank = int(os.environ["LOCAL_RANK"])
     device_obj = torch.device(f"cuda:{local_rank}")

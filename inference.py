@@ -7,7 +7,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from omegaconf import DictConfig, OmegaConf
 
-from src.models.gpt_te import GPT
+from src.models.gpt_moe import GPT
 
 
 def maybe_init_dist(device: str):

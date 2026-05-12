@@ -1,8 +1,8 @@
 import sys
 import traceback
 import torch
-from src.models.gpt_basic import GPT
-from src.training.trainer_basic import Trainer, TrainerConfig
+from src.models.gpt_dense import GPT
+from src.training.trainer_dense import Trainer, TrainerConfig
 from src.utils.helpers import print_trainable_parameters, estimate_flops
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -14,7 +14,7 @@ import torch.distributed as dist
 from datetime import timedelta
 
 
-@hydra.main(version_base=None, config_name="config_pretrain_basic", config_path="config")
+@hydra.main(version_base=None, config_name="config_dense", config_path="config")
 def main(cfg: DictConfig):
     local_rank = int(os.environ["LOCAL_RANK"])
     device_obj = torch.device(f"cuda:{local_rank}")

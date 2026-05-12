@@ -5,7 +5,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from omegaconf import DictConfig, OmegaConf
 
-from src.models.gpt_te import GPT
+from src.models.gpt_moe import GPT
 from src.eval.metrics import evaluate_hella_swag
 
 
