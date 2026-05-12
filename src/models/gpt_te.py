@@ -8,108 +8,65 @@ import torch.distributed as dist
 import transformer_engine.pytorch as te
 import json
 import os
-import time
 
 
-class MLA(nn.Module):
-    def __init__(
-        self,
-        n_embd,
-        n_heads,
-        head_size,
-        rope_head_size,
-        kv_latent_size,
-        q_latent_size,
-        dtype=None,
-    ):
+class GQA(nn.Module):
+    def __init__(self, n_embd, n_heads, n_kv_heads, dtype=None):
         super().__init__()
-        self.n_embd = n_embd
+        assert n_embd % n_heads == 0, "n_embd must be divisible by n_heads"
+        assert n_heads % n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
         self.n_heads = n_heads
-        self.head_size = head_size
-        self.rope_head_size = rope_head_size
-        self.latent_head_size = head_size - rope_head_size
-        self.kv_latent_size = kv_latent_size
-        self.q_latent_size = q_latent_size
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = n_embd // n_heads
 
-        # Fused Down-Projection
-        # Projects x into ALL latent vectors at once: (Q_latent | KV_latent | K_rope)
-        self.w_down = te.Linear(
-            n_embd,
-            q_latent_size + kv_latent_size + rope_head_size,
-            bias=False,
-            params_dtype=dtype,
+        self.w_q = te.Linear(
+            n_embd, n_heads * self.head_dim, bias=False, params_dtype=dtype
         )
-
-        self.q_norm = nn.RMSNorm(q_latent_size, dtype=dtype)
-        self.kv_norm = nn.RMSNorm(kv_latent_size, dtype=dtype)
-
-        # Up-projections
-        self.w_up_qr = te.Linear(
-            q_latent_size,
-            n_heads * (self.latent_head_size + rope_head_size),
-            bias=False,
-            params_dtype=dtype,
+        self.w_k = te.Linear(
+            n_embd, n_kv_heads * self.head_dim, bias=False, params_dtype=dtype
         )
-        self.w_up_kv = te.Linear(
-            kv_latent_size,
-            n_heads * (self.latent_head_size + head_size),
-            bias=False,
-            params_dtype=dtype,
+        self.w_v = te.Linear(
+            n_embd, n_kv_heads * self.head_dim, bias=False, params_dtype=dtype
         )
-
         self.proj = te.Linear(
-            n_heads * head_size, n_embd, bias=False, params_dtype=dtype
+            n_heads * self.head_dim, n_embd, bias=False, params_dtype=dtype
         )
         self.proj.RESIDUAL_SCALE_INIT_FACTOR = True
 
-    def forward(self, x, sin, cos):
-        B, T, _ = x.shape
-        H = self.n_heads
-        d_c = self.latent_head_size
+        self.q_norm = nn.RMSNorm(self.head_dim, dtype=dtype)
+        self.k_norm = nn.RMSNorm(self.head_dim, dtype=dtype)
 
-        # Fused Projection & Split
-        fused_down = self.w_down(x)
-        c_q, c_kv, k_rope = fused_down.split(
-            [self.q_latent_size, self.kv_latent_size, self.rope_head_size], dim=-1
+    def forward(self, x, sin, cos, is_first_microbatch=None):
+        B, T, _ = x.shape
+
+        q = (
+            self.w_q(x, is_first_microbatch=is_first_microbatch)
+            .view(B, T, self.n_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.w_k(x, is_first_microbatch=is_first_microbatch)
+            .view(B, T, self.n_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.w_v(x, is_first_microbatch=is_first_microbatch)
+            .view(B, T, self.n_kv_heads, self.head_dim)
+            .transpose(1, 2)
         )
 
-        # Normalization
-        c_q = self.q_norm(c_q)
-        c_kv = self.kv_norm(c_kv)
+        q = apply_rotary_emb(q, sin, cos).to(x.dtype)
+        k = apply_rotary_emb(k, sin, cos).to(x.dtype)
+        q, k = self.q_norm(q), self.k_norm(k)
 
-        # RoPE Shared Key (Optimization: Rotate the tiny shared key once)
-        # Reshape to (B, 1, T, 64) so it broadcasts to all heads later
-        k_rope = apply_rotary_emb(k_rope.unsqueeze(1), sin, cos)
-
-        # Generate Query (Q)
-        # Project up -> Split into Content & RoPE parts
-        q_lr = self.w_up_qr(c_q).view(B, T, H, -1).transpose(1, 2)
-        q_l = q_lr[..., :d_c]
-        q_r = q_lr[..., d_c:]
-
-        q_r = apply_rotary_emb(q_r, sin, cos)
-        q = torch.cat((q_l, q_r), dim=-1)  # (B, H, T, head_size)
-
-        # Generate Key/Value (K, V)
-        # Project up -> Split into Key-Content & Value
-        kv = self.w_up_kv(c_kv).view(B, T, H, -1).transpose(1, 2)
-
-        k_l = kv[..., :d_c]
-        v = kv[..., d_c:]  # Value is ready
-
-        # Combine Key-Content with the Shared RoPE Key
-        k = torch.cat((k_l, k_rope.expand(B, H, T, -1)), dim=-1)
-
-        # Attention
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
-        return self.proj(out)
+        return self.proj(out, is_first_microbatch=is_first_microbatch)
 
 
 # Attention (Kept as fallback/reference)
 class Attention(nn.Module):
-    def __init__(self, n_embd, n_heads, rope_head_size, n_kv_heads=None, dtype=None):
+    def __init__(self, n_embd, n_heads, dtype=None):
         super().__init__()
         assert (
             n_embd % n_heads == 0
@@ -117,55 +74,24 @@ class Attention(nn.Module):
         self.n_embd = n_embd
         self.n_heads = n_heads
         self.H = n_embd // n_heads  # head size
-        self.n_kv_heads = n_heads if n_kv_heads is None else n_kv_heads
-        assert (
-            n_heads % self.n_kv_heads == 0
-        ), f"n_heads ({n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})."
-        assert (
-            0 < rope_head_size <= self.H
-        ), f"rope_head_size ({rope_head_size}) must be in (0, {self.H}]."
-        assert (
-            rope_head_size % 2 == 0
-        ), f"rope_head_size ({rope_head_size}) must be even for RoPE."
-        self.rope_head_size = rope_head_size
-        kv_dim = self.n_kv_heads * self.H
-        self.attn = te.Linear(
-            n_embd, n_embd + 2 * kv_dim, bias=False, params_dtype=dtype
-        )
+        self.attn = te.Linear(n_embd, 3 * n_embd, bias=False, params_dtype=dtype)
         self.proj = te.Linear(n_embd, n_embd, bias=False, params_dtype=dtype)
-        self.q_norm = nn.RMSNorm(self.H, dtype=dtype)
-        self.k_norm = nn.RMSNorm(self.H, dtype=dtype)
+        self.q_norm = te.RMSNorm(self.H, params_dtype=dtype)
+        self.k_norm = te.RMSNorm(self.H, params_dtype=dtype)
         self.proj.RESIDUAL_SCALE_INIT_FACTOR = True
 
-    @torch.compile
     def forward(self, x, sin, cos):
         B, T, C = x.shape
-        kv_dim = self.n_kv_heads * self.H
-        q, k, v = self.attn(x).split([self.n_embd, kv_dim, kv_dim], dim=-1)
+        q, k, v = self.attn(x).split(self.n_embd, dim=-1)
         q = q.view(B, T, self.n_heads, self.H).transpose(1, 2)
-        k = k.view(B, T, self.n_kv_heads, self.H).transpose(1, 2)
-        v = v.view(B, T, self.n_kv_heads, self.H).transpose(1, 2)
-        attn_dtype = self.q_norm.weight.dtype
-        q = q.to(attn_dtype)
-        k = k.to(attn_dtype)
-        v = v.to(attn_dtype)
-
-        q_rope, q_plain = q[..., : self.rope_head_size], q[..., self.rope_head_size :]
-        k_rope, k_plain = k[..., : self.rope_head_size], k[..., self.rope_head_size :]
-
-        q_rope = apply_rotary_emb(q_rope, sin, cos)
-        k_rope = apply_rotary_emb(k_rope, sin, cos)
-
-        q = torch.cat((q_rope, q_plain), dim=-1)
-        k = torch.cat((k_rope, k_plain), dim=-1)
+        k = k.view(B, T, self.n_heads, self.H).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.H).transpose(1, 2)
+        # Apply RoPE
+        q = apply_rotary_emb(q, sin, cos).to(x.dtype)
+        k = apply_rotary_emb(k, sin, cos).to(x.dtype)
         q, k = self.q_norm(q), self.k_norm(k)
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            is_causal=True,
-            enable_gqa=self.n_kv_heads != self.n_heads,
-        )
+
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.proj(out)
@@ -216,10 +142,10 @@ class SharedExpert(nn.Module):
         )
         self.down_proj.RESIDUAL_SCALE_INIT_FACTOR = True
 
-    def forward(self, x):
-        gate = F.silu(self.gate_proj(x))
-        x = gate * self.up_proj(x)
-        return self.down_proj(x)
+    def forward(self, x, is_first_microbatch=None):
+        gate = F.silu(self.gate_proj(x, is_first_microbatch=is_first_microbatch))
+        x = gate * self.up_proj(x, is_first_microbatch=is_first_microbatch)
+        return self.down_proj(x, is_first_microbatch=is_first_microbatch)
 
 
 # Decides which experts will be used
@@ -300,10 +226,10 @@ class MoE(nn.Module):
             correction = torch.sign(target_load - actual_load)
             self.gate.bias.add_(update_rate * correction)  # pyrefly: ignore
 
-    def forward(self, x):
+    def forward(self, x, is_first_microbatch=None):
         B, T, C = x.shape
         x_flat = x.view(-1, C)
-        shared = self.shared_experts(x)
+        shared = self.shared_experts(x, is_first_microbatch=is_first_microbatch)
 
         topk_idx, weights = self.gate(x_flat)
 
@@ -327,11 +253,15 @@ class MoE(nn.Module):
             self.update_bias(tokens_per_expert)
 
         routed_up_proj, routed_gate = self.routed_fused_proj(
-            permuted_x, m_splits=local_tokens_per_expert_list
+            permuted_x,
+            m_splits=local_tokens_per_expert_list,
+            is_first_microbatch=is_first_microbatch,
         ).chunk(2, dim=-1)
         permuted_up_x = routed_up_proj * F.silu(routed_gate)
         permuted_y = self.routed_down_proj(
-            permuted_up_x, m_splits=local_tokens_per_expert_list
+            permuted_up_x,
+            m_splits=local_tokens_per_expert_list,
+            is_first_microbatch=is_first_microbatch,
         )
 
         routed = te.moe_unpermute(
@@ -375,6 +305,9 @@ class ExpertParallelMoE(nn.Module):
         self.shared_experts = SharedExpert(
             n_embd, hidden_size=n_shared_experts * expert_hidden_size, dtype=dtype
         )
+        self.shared_experts_compiled = torch.compile(
+            self.shared_experts
+        )  # pyrefly:ignore
 
         # 2. Local Experts: Size is reduced to (Total / World_Size)
         self.routed_fused_proj = te.GroupedLinear(
@@ -403,12 +336,17 @@ class ExpertParallelMoE(nn.Module):
             correction = torch.sign(target_load - actual_load)
             self.gate.bias.add_(update_rate * correction)  # pyrefly: ignore
 
-    def forward(self, x):
+    def forward(self, x, is_first_microbatch=None):
         B, T, C = x.shape
         x_flat = x.view(-1, C)
 
         # Shared experts
-        shared = self.shared_experts(x)
+        if self.training:
+            shared = self.shared_experts_compiled(
+                x, is_first_microbatch=is_first_microbatch
+            )
+        else:
+            shared = self.shared_experts(x, is_first_microbatch=is_first_microbatch)
 
         # Routing (Global)
         topk_idx, weights = self.gate(x_flat)
@@ -487,12 +425,18 @@ class ExpertParallelMoE(nn.Module):
         ).tolist()
 
         # Forward Pass through Experts
-        up = self.routed_fused_proj(recv_x_te, m_splits=tokens_per_local_expert)
+        up = self.routed_fused_proj(
+            recv_x_te,
+            m_splits=tokens_per_local_expert,
+            is_first_microbatch=is_first_microbatch,
+        )
         gate = up.chunk(2, dim=-1)[1]
         up = up.chunk(2, dim=-1)[0]
 
         h = up * F.silu(gate)
-        out_te = self.routed_down_proj(h, m_splits=tokens_per_local_expert)
+        out_te = self.routed_down_proj(
+            h, m_splits=tokens_per_local_expert, is_first_microbatch=is_first_microbatch
+        )
 
         # Apply routing weights
         out_te = out_te * recv_weights[te_sort_idx].unsqueeze(-1)
@@ -537,10 +481,6 @@ class Block(nn.Module):
         n_embd,
         n_heads,
         n_kv_heads,
-        head_size,
-        rope_head_size,
-        kv_latent_size,
-        q_latent_size,
         n_shared_experts,
         n_routed_experts,
         topk,
@@ -549,22 +489,8 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.ln1 = te.RMSNorm(n_embd, params_dtype=dtype)
-        # self.sa = MLA(
-        #     n_embd,
-        #     n_heads,
-        #     head_size,
-        #     rope_head_size,
-        #     kv_latent_size,
-        #     q_latent_size,
-        #     dtype=dtype,
-        # )
-        self.sa = Attention(
-            n_embd,
-            n_heads,
-            rope_head_size,
-            n_kv_heads=n_kv_heads,
-            dtype=dtype,
-        )
+        self.sa = GQA(n_embd, n_heads, n_kv_heads, dtype=dtype)
+        self.sa_compiled = torch.compile(self.sa)  # pyrefly:ignore
         self.ln2 = te.RMSNorm(n_embd, params_dtype=dtype)
         self.moe = ExpertParallelMoE(
             n_embd,
@@ -575,9 +501,16 @@ class Block(nn.Module):
             dtype=dtype,
         )
 
-    def forward(self, x, sin, cos):
-        x = x + self.sa(self.ln1(x), sin, cos)
-        x = x + self.moe(self.ln2(x))
+    def forward(self, x, sin, cos, is_first_microbatch=None):
+        if self.training:
+            x = x + self.sa_compiled(
+                self.ln1(x), sin, cos, is_first_microbatch=is_first_microbatch
+            )
+        else:
+            x = x + self.sa(
+                self.ln1(x), sin, cos, is_first_microbatch=is_first_microbatch
+            )
+        x = x + self.moe(self.ln2(x), is_first_microbatch=is_first_microbatch)
         return x
 
 
@@ -590,10 +523,6 @@ class GPT(nn.Module):
         block_size,
         n_heads,
         n_kv_heads,
-        head_size,
-        rope_head_size,
-        kv_latent_size,
-        q_latent_size,
         n_layers,
         n_shared_experts,
         n_routed_experts,
@@ -608,7 +537,8 @@ class GPT(nn.Module):
         self.n_layers = n_layers
         self.wte = nn.Embedding(vocab_size, n_embd)
 
-        sin, cos = self._precompute_rotary_embeddings(block_size, rope_head_size)
+        head_dim = n_embd // n_heads
+        sin, cos = self._precompute_rotary_embeddings(block_size, head_dim)
         self.register_buffer("sin", sin, persistent=False)
         self.register_buffer("cos", cos, persistent=False)
         self.transformer = nn.ModuleList(
@@ -617,10 +547,6 @@ class GPT(nn.Module):
                     n_embd,
                     n_heads,
                     n_kv_heads,
-                    head_size,
-                    rope_head_size,
-                    kv_latent_size,
-                    q_latent_size,
                     n_shared_experts,
                     n_routed_experts,
                     topk_experts,
@@ -699,7 +625,7 @@ class GPT(nn.Module):
             if hasattr(module, "bias") and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)  # pyrefly: ignore
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, is_first_microbatch=None):
         B, T = idx.shape
         assert (
             T <= self.block_size
@@ -709,7 +635,7 @@ class GPT(nn.Module):
         cos = self.cos[:, :, :T, :]  # pyrefly: ignore
 
         for block in self.transformer:
-            x = block(x, sin, cos)
+            x = block(x, sin, cos, is_first_microbatch=is_first_microbatch)
         x = self.ln(x)
 
         if self.training:
@@ -733,7 +659,7 @@ class GPT(nn.Module):
         max_tokens=200,
         topk=50,
         chat_mode=False,
-        eos_token=50256,
+        eos_token=151643,
     ):
         idx = torch.repeat_interleave(idx.unsqueeze(0), num_sequences, dim=0)
 
@@ -752,29 +678,35 @@ class GPT(nn.Module):
         return idx
 
     def configure_optimizers(self, weight_decay, learning_rate, device_type):
-        decay_params = []
-        nodecay_params = []
+        from src.utils.optimizers import DualOptimizer
+
+        muon_params = []
+        adamw_decay_params = []
+        adamw_nodecay_params = []
         seen = set()
 
-        for n, p in self.named_parameters():
-            if p.requires_grad:
-                if id(p) in seen:
-                    continue
-                seen.add(id(p))
+        for pn, p in self.named_parameters():
+            if not p.requires_grad or id(p) in seen:
+                continue
+            seen.add(id(p))
 
-                if p.dim() >= 2:
-                    decay_params.append(p)
-                else:
-                    nodecay_params.append(p)
-
-        optim_groups = [
-            {"params": decay_params, "weight_decay": weight_decay},
-            {"params": nodecay_params, "weight_decay": 0.0},
-        ]
+            if p.dim() >= 2 and "wte" not in pn and "lm_head" not in pn:
+                muon_params.append(p)
+            elif p.dim() >= 2:
+                adamw_decay_params.append(p)
+            else:
+                adamw_nodecay_params.append(p)
 
         if self.rank == 0:
-            print(f"Decayed params: {sum(p.numel() for p in decay_params):,}")
-            print(f"No-decay params: {sum(p.numel() for p in nodecay_params):,}")
+            print(
+                f"Muon params (2D hidden): {len(muon_params)} tensors, {sum(p.numel() for p in muon_params):,} parameters"
+            )
+            print(
+                f"AdamW decay params (Embed/Head): {len(adamw_decay_params)} tensors, {sum(p.numel() for p in adamw_decay_params):,} parameters"
+            )
+            print(
+                f"AdamW no-decay params (1D norms): {len(adamw_nodecay_params)} tensors, {sum(p.numel() for p in adamw_nodecay_params):,} parameters"
+            )
 
         use_fused = (device_type == "cuda") and (
             "fused" in inspect.signature(torch.optim.AdamW).parameters
@@ -782,9 +714,27 @@ class GPT(nn.Module):
         if self.rank == 0:
             print(f"Using fused AdamW: {use_fused}")
 
-        return torch.optim.AdamW(
-            optim_groups, lr=learning_rate, betas=(0.9, 0.95), fused=use_fused
+        adam_opt = torch.optim.AdamW(
+            [
+                {"params": adamw_decay_params, "weight_decay": weight_decay},
+                {"params": adamw_nodecay_params, "weight_decay": 0.0},
+            ],
+            lr=learning_rate,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            fused=use_fused,
         )
+
+        muon_opt = torch.optim.Muon(
+            muon_params,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            momentum=0.95,
+            nesterov=True,
+            adjust_lr_fn="match_rms_adamw",
+        )
+
+        return DualOptimizer(adam_opt, muon_opt)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:

@@ -1,29 +1,20 @@
 import sys
 import traceback
 import torch
-from src.models.gpt_te import GPT, Block
-from src.training.trainer_te import Trainer, TrainerConfig
+from src.models.gpt_basic import GPT
+from src.training.trainer_basic import Trainer, TrainerConfig
 from src.utils.helpers import print_trainable_parameters, estimate_flops
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from typing import Any, cast
 import os
 import wandb
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from datetime import timedelta
 
 
-# fsdp policy
-def fsdp_auto_wrap_policy(module, recurse, nonwrapped_numel):
-    return transformer_auto_wrap_policy(
-        module, recurse, nonwrapped_numel, transformer_layer_cls={Block}
-    )
-
-
-@hydra.main(version_base=None, config_name="config_pretrain", config_path="config")
+@hydra.main(version_base=None, config_name="config_pretrain_basic", config_path="config")
 def main(cfg: DictConfig):
     local_rank = int(os.environ["LOCAL_RANK"])
     device_obj = torch.device(f"cuda:{local_rank}")
@@ -39,7 +30,7 @@ def main(cfg: DictConfig):
         master_rank = False
 
     try:
-        _run_training(cfg, device_obj, master_rank)
+        _run_training(cfg, device_obj, local_rank, master_rank)
     except Exception:
         traceback.print_exc()
         if dist.is_initialized():
@@ -47,7 +38,9 @@ def main(cfg: DictConfig):
         sys.exit(1)
 
 
-def _run_training(cfg: DictConfig, device_obj: torch.device, master_rank: bool):
+def _run_training(
+    cfg: DictConfig, device_obj: torch.device, local_rank: int, master_rank: bool
+):
     # init wandb
     wandb_run = None
     if master_rank:
@@ -70,13 +63,7 @@ def _run_training(cfg: DictConfig, device_obj: torch.device, master_rank: bool):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    mp_policy = MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
-        buffer_dtype=torch.float32,
-    )
-
-    # Define model
+    # Define dense model
     model = GPT(
         n_embd=cfg.model.n_embd,
         vocab_size=cfg.model.vocab_size,
@@ -84,31 +71,16 @@ def _run_training(cfg: DictConfig, device_obj: torch.device, master_rank: bool):
         n_heads=cfg.model.n_heads,
         n_kv_heads=cfg.model.n_kv_heads,
         n_layers=cfg.model.n_layers,
-        n_shared_experts=cfg.model.n_shared_experts,
-        n_routed_experts=cfg.model.n_routed_experts,
-        topk_experts=cfg.model.topk_experts,
-        expert_hidden_size=cfg.model.expert_hidden_size,
+        ffn_hidden_size=cfg.model.ffn_hidden_size,
         dtype=torch.bfloat16,
     )
-
-    # Move to device BEFORE FSDP wrapping
     model.to(device_obj)
 
-    ep_ignored_modules = []
-    for block in model.transformer:
-        ep_ignored_modules.append(block.moe)  # pyrefly: ignore
+    # DDP wrapping (dense model -- every rank holds the full model)
+    model = DDP(model, device_ids=[local_rank])
 
-    model = FSDP(
-        model,
-        auto_wrap_policy=fsdp_auto_wrap_policy,
-        ignored_modules=ep_ignored_modules,  # pyrefly: ignore
-        device_id=device_obj,
-        use_orig_params=True,
-        mixed_precision=mp_policy,
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-    )
-
-    # model = torch.compile(model)
+    # Compile for throughput
+    model = torch.compile(model)
 
     # trainer
     trainer_config = TrainerConfig(

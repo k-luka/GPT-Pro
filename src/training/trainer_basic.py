@@ -1,3 +1,4 @@
+import contextlib
 import torch
 from dataclasses import dataclass
 from src.datasets.dataloader import DataLoader
@@ -6,9 +7,9 @@ import time
 import math
 import os
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 import torch.distributed.checkpoint
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import Format, DelayedScaling
 
 
 @dataclass
@@ -16,6 +17,7 @@ class TrainerConfig:
     run_name: str = "test1"
     batch_size: int = 64
     grad_accum_steps: int = 4
+    batch_warmup_steps: int = 0
     block_size: int = 1024
     max_steps: int = 1000
     warmup_steps: int = 100
@@ -31,6 +33,14 @@ class TrainerConfig:
     eval_batch_size: int = 64
     eval_block_size: int = 1024
     device: str = "cuda"
+
+
+def _unwrap(model):
+    """Strip DDP (and torch.compile) wrappers to reach the underlying GPT module."""
+    inner = model.module if hasattr(model, "module") else model
+    if hasattr(inner, "_orig_mod"):
+        inner = inner._orig_mod
+    return inner
 
 
 class Trainer:
@@ -50,7 +60,6 @@ class Trainer:
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
 
-        # Pass rank and world_size to DataLoader to fix data duplication
         self.train_loader = DataLoader(
             train_data_root,
             config.batch_size,
@@ -68,15 +77,29 @@ class Trainer:
             world_size=self.world_size,
         )
 
-        self.optimizer = self.model.configure_optimizers(
-            self.config.weight_decay, self.config.learning_rate, self.config.device
+        # DDP doesn't forward attribute access — call configure_optimizers on the inner module.
+        self.optimizer = _unwrap(self.model).configure_optimizers(
+            self.config.weight_decay, self.config.max_lr, self.config.device
         )
         self.tokenizer = tokenizer
         self.step = 0
+        self._prefetch_stream = torch.cuda.Stream()
+        self._prefetched = None
 
-        for param in self.model.parameters():
-            if param.requires_grad:
-                param.main_grad = torch.zeros_like(param, dtype=torch.float32)
+        self.fp8_format = Format.HYBRID
+        self.fp8_recipe = DelayedScaling(
+            fp8_format=self.fp8_format, amax_history_len=16, amax_compute_algo="max"
+        )
+
+    def get_grad_accum_steps(self, step):
+        target = self.config.grad_accum_steps
+        if (
+            self.config.batch_warmup_steps <= 0
+            or step >= self.config.batch_warmup_steps
+        ):
+            return target
+        frac = step / self.config.batch_warmup_steps
+        return max(1, round(1 + frac * (target - 1)))
 
     def get_lr(self, it):
         if it < self.config.warmup_steps:
@@ -90,65 +113,65 @@ class Trainer:
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return self.config.min_lr + coeff * (self.config.max_lr - self.config.min_lr)
 
-    def _train_global_batch(self):
+    def _prefetch(self):
+        """Prefetch next batch to GPU on a separate CUDA stream."""
+        x, y = next(self.train_loader)
+        with torch.cuda.stream(self._prefetch_stream):
+            self._prefetched = (
+                x.to(self.config.device, non_blocking=True),
+                y.to(self.config.device, non_blocking=True),
+            )
+
+    def _get_prefetched(self):
+        """Wait for prefetch to complete and return the batch."""
+        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        return self._prefetched
+
+    def _train_global_batch(self, grad_accum_steps):
         self.optimizer.zero_grad()
-        for param in self.model.parameters():
-            if param.requires_grad and hasattr(param, "main_grad"):
-                param.main_grad.zero_()
-
         loss_accum = 0.0
-        for step in range(self.config.grad_accum_steps):
-            x, y = next(self.train_loader)
-            x, y = x.to(self.config.device), y.to(self.config.device)
-            with torch.autocast(device_type=self.config.device, dtype=torch.bfloat16):
-                _, loss = self.model(x, y)
-            loss = (
-                loss / self.config.grad_accum_steps
-            )  # scale loss as otherwise it would accumulate
-            loss_accum += loss.detach()
-            loss.backward()
-            # Calculate gradients in bf16 but accumulate gradients in float32
-            for param in self.model.parameters():
-                if (
-                    param.requires_grad
-                    and hasattr(param, "main_grad")
-                    and param.grad is not None
+
+        # Kick off first prefetch
+        self._prefetch()
+
+        for micro_step in range(grad_accum_steps):
+            x, y = self._get_prefetched()
+            is_last = micro_step == grad_accum_steps - 1
+
+            # Start prefetching the next microbatch while compute runs
+            if not is_last:
+                self._prefetch()
+
+            torch.compiler.cudagraph_mark_step_begin()
+
+            # Skip DDP gradient sync for all but the last microbatch — the last
+            # backward triggers a single all-reduce over the fully-accumulated grad.
+            ctx = contextlib.nullcontext() if is_last else self.model.no_sync()
+            with ctx:
+                with torch.autocast(
+                    device_type=self.config.device, dtype=torch.bfloat16
                 ):
-                    param.main_grad.add_(param.grad)
-                    param.grad = (
-                        None  # Immediatly let go of the bf16 grads to free memory
-                    )
+                    with te.autocast(
+                        enabled=True,
+                        recipe=self.fp8_recipe,
+                        amax_reduction_group=dist.group.WORLD,
+                    ):
+                        # is_first_microbatch=True on the first step lets TE cache the
+                        # FP8-cast weights for reuse across all gradient accumulation steps.
+                        _, loss = self.model(
+                            x, y, is_first_microbatch=(micro_step == 0)
+                        )
+                loss = loss / grad_accum_steps
+                loss_accum += loss.detach()
+                loss.backward()
 
-        # Reassign the accumulated gradients
-        for param in self.model.parameters():
-            if param.requiers_grad and hasattr(param, "main_grad"):
-                param.grad = param.main_grad.to(param.dtype)
-
-        torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), 1.0
-        )  # gradient clipping
+        if hasattr(self.optimizer, "get_adamw_params"):
+            torch.nn.utils.clip_grad_norm_(self.optimizer.get_adamw_params(), 1.0)
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
         return loss_accum
-
-    def _generate(self):
-        """Prints some generations to see how the model is doing"""
-        if self.tokenizer is None:
-            return
-
-        with FSDP.summon_full_params(self.model, writeback=False, rank0_only=True):
-            if self.rank == 0:
-                print("\n--- [Generation] -------------------------")
-                self.model.eval()
-                gen_prompt = self.tokenizer.encode("Hello ")
-                context = torch.tensor(
-                    gen_prompt, dtype=torch.long, device=self.config.device
-                )
-                with torch.no_grad():
-                    response = self.model.generate(context)
-                print(">", self.tokenizer.decode(response[0].tolist()))
-                print("------------------------------------------\n")
-                self.model.train()
 
     def train(self, resume_from_checkpoint=None):
         self.model.train()
@@ -161,6 +184,7 @@ class Trainer:
                 print(
                     f"---| Resuming training from step {start_step} until {self.config.max_steps} |---"
                 )
+            self.train_loader.set_step(self.step, self.config.grad_accum_steps)
 
         else:
             if self.rank == 0:
@@ -170,35 +194,34 @@ class Trainer:
         for step in range(start_step, self.config.max_steps + 1):
             self.step = step
             t0 = time.time()
-            # set the learning_rate
             lr = self.get_lr(step)
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = lr
-            loss = self._train_global_batch()
+            current_accum = self.get_grad_accum_steps(step)
+            loss = self._train_global_batch(current_accum)
             torch.cuda.synchronize()
             t1 = time.time()
             dt = t1 - t0
             tps = (
                 self.train_loader.B
                 * self.train_loader.T
-                * self.config.grad_accum_steps
+                * current_accum
                 * self.world_size
             ) / dt
 
             if self.rank == 0:
-                # report to wandb
                 if self.wandb_run is not None:
                     self.wandb_run.log(
                         {
                             "train loss": float(loss),
                             "tokens/sec": float(tps),
                             "train step time (ms)": dt * 1000,
-                        }
+                        },
+                        step=step,
                     )
-                # print train loss and stats to console
                 if step % self.config.logging_steps == 0:
                     print(
-                        f"Step: {step} | loss: {loss:.6f} | dt: {dt*1000:.4f} ms | tokens/sec: {tps:.4f}"
+                        f"Step: {step} | loss: {loss:.6f} | dt: {dt * 1000:.4f} ms | tokens/sec: {tps:.4f}"
                     )
             # eval loss and report it
             val_loss = None
@@ -219,7 +242,8 @@ class Trainer:
                 if self.rank == 0:
                     if self.wandb_run is not None:
                         self.wandb_run.log(
-                            {"val loss": val_loss, "HellaSwag accuracy": hella_acc}
+                            {"val loss": val_loss, "HellaSwag accuracy": hella_acc},
+                            step=step,
                         )
             # once in a while save checkpoint
             if step % self.config.checkpoint_interval == 0:
@@ -234,29 +258,28 @@ class Trainer:
                     dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
                     val_loss = val_loss_tensor.item()
                 self.save_checkpoint(val_loss, step, is_best=False)
-            # # once in a while generate from model
-            # if step % self.config.generation_interval == 0:
-            #     self._generate()
 
     def save_checkpoint(self, val_loss, step, is_best=False):
-        """Saves a checkpoint using PyTorch DCP"""
+        """Saves a checkpoint using PyTorch DCP."""
+        if is_best:
+            checkpoint_path = f"output/checkpoints/{self.config.run_name}/best_val"
+            if self.rank == 0 and os.path.exists(checkpoint_path):
+                import shutil
 
-        checkpoint_path = f"output/checkpoints/{self.config.run_name}/step_{step}"
+                shutil.rmtree(checkpoint_path)
+            dist.barrier()
+        else:
+            checkpoint_path = f"output/checkpoints/{self.config.run_name}/step_{step}"
+
         os.makedirs(checkpoint_path, exist_ok=True)
         if self.rank == 0:
             print(f"---| Saving checkpoint to {checkpoint_path} |---")
 
-        # UNWRAP torch.compile
-        # We must save the underlying FSDP module, not the OptimizedModule wrapper.
-        fsdp_model = self.model
-        if hasattr(self.model, "_orig_mod"):
-            fsdp_model = self.model._orig_mod
+        base_model = _unwrap(self.model)
 
-        # Create the Stateful Dictionary
-        # Wrap 'step' in a tensor so it is a valid stateful object
         step_tensor = torch.tensor(step)
         state_dict = {
-            "model": fsdp_model,
+            "model": base_model,
             "optimizer": self.optimizer,
             "step": step_tensor,
         }
@@ -268,18 +291,15 @@ class Trainer:
         )
 
     def load_checkpoint(self, checkpoint_path):
-        """Loads a checkpoint using PyTorch DCP"""
+        """Loads a checkpoint using PyTorch DCP."""
         if self.rank == 0:
             print(f"---| Loading checkpoint from {checkpoint_path} |---")
 
-        # UNWRAP torch.compile
-        fsdp_model = self.model
-        if hasattr(self.model, "_orig_mod"):
-            fsdp_model = self.model._orig_mod
+        base_model = _unwrap(self.model)
 
         step_tensor = torch.tensor(0)
         state_dict = {
-            "model": fsdp_model,
+            "model": base_model,
             "optimizer": self.optimizer,
             "step": step_tensor,
         }
@@ -289,3 +309,4 @@ class Trainer:
                 checkpoint_path
             ),
         )
+        self.step = step_tensor.item()  # pyrefly:ignore
