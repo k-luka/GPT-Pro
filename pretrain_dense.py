@@ -79,7 +79,8 @@ def _run_training(
     # DDP wrapping (dense model -- every rank holds the full model)
     model = DDP(model, device_ids=[local_rank])
 
-    # Compile for throughput
+    # Compile for throughput — enable profiler annotation capture to avoid dynamo warnings
+    torch._dynamo.config.capture_profiler_record_function = True
     model = torch.compile(model)
 
     # trainer
