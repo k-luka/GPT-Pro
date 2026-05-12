@@ -1,0 +1,312 @@
+import contextlib
+import torch
+from dataclasses import dataclass
+from src.datasets.dataloader import DataLoader
+from src.eval.metrics import estimate_loss, evaluate_hella_swag
+import time
+import math
+import os
+import torch.distributed as dist
+import torch.distributed.checkpoint
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import Format, DelayedScaling
+
+
+@dataclass
+class TrainerConfig:
+    run_name: str = "test1"
+    batch_size: int = 64
+    grad_accum_steps: int = 4
+    batch_warmup_steps: int = 0
+    block_size: int = 1024
+    max_steps: int = 1000
+    warmup_steps: int = 100
+    min_lr: float = 1e-4
+    max_lr: float = 6e-4
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.1
+    logging_steps: int = 1
+    checkpoint_interval: int = 1000
+    generation_interval: int = 50
+    eval_interval: int = 200
+    eval_steps: int = 200
+    eval_batch_size: int = 64
+    eval_block_size: int = 1024
+    device: str = "cuda"
+
+
+def _unwrap(model):
+    """Strip DDP (and torch.compile) wrappers to reach the underlying GPT module."""
+    inner = model.module if hasattr(model, "module") else model
+    if hasattr(inner, "_orig_mod"):
+        inner = inner._orig_mod
+    return inner
+
+
+class Trainer:
+    def __init__(
+        self,
+        model,
+        train_data_root,
+        val_data_root,
+        config: TrainerConfig,
+        tokenizer=None,
+        wandb_run=None,
+    ):
+        self.config = config
+        self.model = model
+        self.wandb_run = wandb_run
+
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+
+        self.train_loader = DataLoader(
+            train_data_root,
+            config.batch_size,
+            config.block_size,
+            "train",
+            rank=self.rank,
+            world_size=self.world_size,
+        )
+        self.val_loader = DataLoader(
+            val_data_root,
+            config.eval_batch_size,
+            config.eval_block_size,
+            "val",
+            rank=self.rank,
+            world_size=self.world_size,
+        )
+
+        # DDP doesn't forward attribute access — call configure_optimizers on the inner module.
+        self.optimizer = _unwrap(self.model).configure_optimizers(
+            self.config.weight_decay, self.config.max_lr, self.config.device
+        )
+        self.tokenizer = tokenizer
+        self.step = 0
+        self._prefetch_stream = torch.cuda.Stream()
+        self._prefetched = None
+
+        self.fp8_format = Format.HYBRID
+        self.fp8_recipe = DelayedScaling(
+            fp8_format=self.fp8_format, amax_history_len=16, amax_compute_algo="max"
+        )
+
+    def get_grad_accum_steps(self, step):
+        target = self.config.grad_accum_steps
+        if (
+            self.config.batch_warmup_steps <= 0
+            or step >= self.config.batch_warmup_steps
+        ):
+            return target
+        frac = step / self.config.batch_warmup_steps
+        return max(1, round(1 + frac * (target - 1)))
+
+    def get_lr(self, it):
+        if it < self.config.warmup_steps:
+            return self.config.max_lr * it / self.config.warmup_steps
+        if it > self.config.max_steps:
+            return self.config.min_lr
+        decay_ratio = (it - self.config.warmup_steps) / (
+            self.config.max_steps - self.config.warmup_steps
+        )
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return self.config.min_lr + coeff * (self.config.max_lr - self.config.min_lr)
+
+    def _prefetch(self):
+        """Prefetch next batch to GPU on a separate CUDA stream."""
+        x, y = next(self.train_loader)
+        with torch.cuda.stream(self._prefetch_stream):
+            self._prefetched = (
+                x.to(self.config.device, non_blocking=True),
+                y.to(self.config.device, non_blocking=True),
+            )
+
+    def _get_prefetched(self):
+        """Wait for prefetch to complete and return the batch."""
+        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        return self._prefetched
+
+    def _train_global_batch(self, grad_accum_steps):
+        self.optimizer.zero_grad()
+        loss_accum = 0.0
+
+        # Kick off first prefetch
+        self._prefetch()
+
+        for micro_step in range(grad_accum_steps):
+            x, y = self._get_prefetched()
+            is_last = micro_step == grad_accum_steps - 1
+
+            # Start prefetching the next microbatch while compute runs
+            if not is_last:
+                self._prefetch()
+
+            torch.compiler.cudagraph_mark_step_begin()
+
+            # Skip DDP gradient sync for all but the last microbatch — the last
+            # backward triggers a single all-reduce over the fully-accumulated grad.
+            ctx = contextlib.nullcontext() if is_last else self.model.no_sync()
+            with ctx:
+                with torch.autocast(
+                    device_type=self.config.device, dtype=torch.bfloat16
+                ):
+                    with te.autocast(
+                        enabled=True,
+                        recipe=self.fp8_recipe,
+                        amax_reduction_group=dist.group.WORLD,
+                    ):
+                        # is_first_microbatch=True on the first step lets TE cache the
+                        # FP8-cast weights for reuse across all gradient accumulation steps.
+                        _, loss = self.model(
+                            x, y, is_first_microbatch=(micro_step == 0)
+                        )
+                loss = loss / grad_accum_steps
+                loss_accum += loss.detach()
+                loss.backward()
+
+        if hasattr(self.optimizer, "get_adamw_params"):
+            torch.nn.utils.clip_grad_norm_(self.optimizer.get_adamw_params(), 1.0)
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.optimizer.step()
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        return loss_accum
+
+    def train(self, resume_from_checkpoint=None):
+        self.model.train()
+
+        start_step = 1
+        if resume_from_checkpoint is not None:
+            self.load_checkpoint(resume_from_checkpoint)
+            start_step = self.step + 1
+            if self.rank == 0:
+                print(
+                    f"---| Resuming training from step {start_step} until {self.config.max_steps} |---"
+                )
+            self.train_loader.set_step(self.step, self.config.grad_accum_steps)
+
+        else:
+            if self.rank == 0:
+                print(f"---| Starting training for {self.config.max_steps} |---")
+
+        best_val_loss = 100
+        for step in range(start_step, self.config.max_steps + 1):
+            self.step = step
+            t0 = time.time()
+            lr = self.get_lr(step)
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = lr
+            current_accum = self.get_grad_accum_steps(step)
+            loss = self._train_global_batch(current_accum)
+            torch.cuda.synchronize()
+            t1 = time.time()
+            dt = t1 - t0
+            tps = (
+                self.train_loader.B
+                * self.train_loader.T
+                * current_accum
+                * self.world_size
+            ) / dt
+
+            if self.rank == 0:
+                if self.wandb_run is not None:
+                    self.wandb_run.log(
+                        {
+                            "train loss": float(loss),
+                            "tokens/sec": float(tps),
+                            "train step time (ms)": dt * 1000,
+                        },
+                        step=step,
+                    )
+                if step % self.config.logging_steps == 0:
+                    print(
+                        f"Step: {step} | loss: {loss:.6f} | dt: {dt * 1000:.4f} ms | tokens/sec: {tps:.4f}"
+                    )
+            # eval loss and report it
+            val_loss = None
+            if step % self.config.eval_interval == 0:
+                val_loss = estimate_loss(
+                    self.model,
+                    self.val_loader,
+                    self.config.eval_steps,
+                    self.config.device,
+                )
+                val_loss_tensor = torch.tensor(val_loss, device=self.config.device)
+                dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
+                val_loss = val_loss_tensor.item()
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    self.save_checkpoint(val_loss, step, is_best=True)
+                hella_acc = evaluate_hella_swag(self.model, self.config.device)
+                if self.rank == 0:
+                    if self.wandb_run is not None:
+                        self.wandb_run.log(
+                            {"val loss": val_loss, "HellaSwag accuracy": hella_acc},
+                            step=step,
+                        )
+            # once in a while save checkpoint
+            if step % self.config.checkpoint_interval == 0:
+                if val_loss is None:
+                    val_loss = estimate_loss(
+                        self.model,
+                        self.val_loader,
+                        self.config.eval_steps,
+                        self.config.device,
+                    )
+                    val_loss_tensor = torch.tensor(val_loss, device=self.config.device)
+                    dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
+                    val_loss = val_loss_tensor.item()
+                self.save_checkpoint(val_loss, step, is_best=False)
+
+    def save_checkpoint(self, val_loss, step, is_best=False):
+        """Saves a checkpoint using PyTorch DCP."""
+        if is_best:
+            checkpoint_path = f"output/checkpoints/{self.config.run_name}/best_val"
+            if self.rank == 0 and os.path.exists(checkpoint_path):
+                import shutil
+
+                shutil.rmtree(checkpoint_path)
+            dist.barrier()
+        else:
+            checkpoint_path = f"output/checkpoints/{self.config.run_name}/step_{step}"
+
+        os.makedirs(checkpoint_path, exist_ok=True)
+        if self.rank == 0:
+            print(f"---| Saving checkpoint to {checkpoint_path} |---")
+
+        base_model = _unwrap(self.model)
+
+        step_tensor = torch.tensor(step)
+        state_dict = {
+            "model": base_model,
+            "optimizer": self.optimizer,
+            "step": step_tensor,
+        }
+        torch.distributed.checkpoint.save(
+            state_dict=state_dict,
+            storage_writer=torch.distributed.checkpoint.FileSystemWriter(
+                checkpoint_path
+            ),
+        )
+
+    def load_checkpoint(self, checkpoint_path):
+        """Loads a checkpoint using PyTorch DCP."""
+        if self.rank == 0:
+            print(f"---| Loading checkpoint from {checkpoint_path} |---")
+
+        base_model = _unwrap(self.model)
+
+        step_tensor = torch.tensor(0)
+        state_dict = {
+            "model": base_model,
+            "optimizer": self.optimizer,
+            "step": step_tensor,
+        }
+        torch.distributed.checkpoint.load(
+            state_dict=state_dict,
+            storage_reader=torch.distributed.checkpoint.FileSystemReader(
+                checkpoint_path
+            ),
+        )
+        self.step = step_tensor.item()  # pyrefly:ignore

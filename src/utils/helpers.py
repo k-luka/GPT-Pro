@@ -9,6 +9,8 @@ import torch.distributed.checkpoint as dcp
 def print_trainable_parameters(cfg, model):
     """
     Estimates parameters based on configuration.
+    Supports both MoE (n_routed_experts, expert_hidden_size, ...) and
+    dense (ffn_hidden_size) configurations.
     """
     # 1. Architecture Constants
     n_layers = cfg.model.n_layers
@@ -18,7 +20,7 @@ def print_trainable_parameters(cfg, model):
     n_kv_heads = cfg.model.n_kv_heads
     head_dim = n_embd // n_heads
 
-    # 2. Embedding + Head
+    # 2. Embedding + Head (weight-tied -> counted once)
     params_emb = vocab_size * n_embd
     params_ln_f = n_embd
 
@@ -32,30 +34,36 @@ def print_trainable_parameters(cfg, model):
 
     params_gqa = params_q + params_k + params_v + params_proj + params_qk_norms
 
-    # --- MoE (Shared + Routed) ---
-    s_hidden_req = cfg.model.get("n_shared_experts", 0) * cfg.model.get(
-        "expert_hidden_size", 0
-    )
-    s_hidden = (s_hidden_req + 255) // 256 * 256
-    params_shared = (n_embd * s_hidden) + (n_embd * s_hidden) + (s_hidden * n_embd)
-
+    # --- FFN: Dense SwiGLU MLP or MoE ---
+    ffn_hidden_size = cfg.model.get("ffn_hidden_size", None)
     n_routed = cfg.model.get("n_routed_experts", 0)
-    topk = cfg.model.get("topk_experts", 0)
-    expert_hidden = cfg.model.get("expert_hidden_size", 0)
 
-    params_per_expert = 3 * n_embd * expert_hidden
+    if ffn_hidden_size is not None:
+        # Dense SwiGLU: gate + up + down projections
+        hidden = (ffn_hidden_size + 255) // 256 * 256
+        params_ffn_total = 3 * n_embd * hidden
+        params_ffn_active = params_ffn_total
+    else:
+        s_hidden_req = cfg.model.get("n_shared_experts", 0) * cfg.model.get(
+            "expert_hidden_size", 0
+        )
+        s_hidden = (s_hidden_req + 255) // 256 * 256
+        params_shared = 3 * (n_embd * s_hidden)
 
-    params_gate = n_embd * n_routed
+        topk = cfg.model.get("topk_experts", 0)
+        expert_hidden = cfg.model.get("expert_hidden_size", 0)
+        params_per_expert = 3 * n_embd * expert_hidden
+        params_gate = n_embd * n_routed
 
-    params_moe_total = params_shared + params_gate + (n_routed * params_per_expert)
-    params_moe_active = params_shared + params_gate + (topk * params_per_expert)
+        params_ffn_total = params_shared + params_gate + (n_routed * params_per_expert)
+        params_ffn_active = params_shared + params_gate + (topk * params_per_expert)
 
     # Block Layer Norms
     params_block_ln = 2 * n_embd
 
     # --- Layer Totals ---
-    params_layer_total = params_gqa + params_moe_total + params_block_ln
-    params_layer_active = params_gqa + params_moe_active + params_block_ln
+    params_layer_total = params_gqa + params_ffn_total + params_block_ln
+    params_layer_active = params_gqa + params_ffn_active + params_block_ln
 
     # 4. Final Sums
     total_params = params_emb + (n_layers * params_layer_total) + params_ln_f
@@ -70,9 +78,12 @@ def print_trainable_parameters(cfg, model):
     print(
         f"| Architecture: {n_layers} layers, {n_heads} heads ({n_kv_heads} KV), {n_embd} dim"
     )
-    print(
-        f"| Experts: {n_routed} routed, {cfg.model.get('n_shared_experts', 0)} shared, TopK: {topk}"
-    )
+    if ffn_hidden_size is not None:
+        print(f"| FFN: dense SwiGLU, hidden {ffn_hidden_size}")
+    else:
+        print(
+            f"| Experts: {n_routed} routed, {cfg.model.get('n_shared_experts', 0)} shared, TopK: {cfg.model.get('topk_experts', 0)}"
+        )
     print("| --------------------------------------------------------------------")
     print(
         f"| Total Params (Storage):      {humanize.intword(total_params)} ({total_params:,})"
@@ -102,23 +113,27 @@ def estimate_flops(cfg):
     params_qk_norms = 2 * head_dim
     params_gqa = params_q + params_k + params_v + params_proj + params_qk_norms
 
-    # MoE Active Params per layer
-    s_hidden_req = cfg.model.get("n_shared_experts", 0) * cfg.model.get(
-        "expert_hidden_size", 0
-    )
-    s_hidden = (s_hidden_req + 255) // 256 * 256
-    params_shared = (n_embd * s_hidden) * 3
+    # FFN Active Params per layer: Dense SwiGLU or MoE
+    ffn_hidden_size = cfg.model.get("ffn_hidden_size", None)
+    if ffn_hidden_size is not None:
+        hidden = (ffn_hidden_size + 255) // 256 * 256
+        params_ffn_active = 3 * n_embd * hidden
+    else:
+        s_hidden_req = cfg.model.get("n_shared_experts", 0) * cfg.model.get(
+            "expert_hidden_size", 0
+        )
+        s_hidden = (s_hidden_req + 255) // 256 * 256
+        params_shared = 3 * (n_embd * s_hidden)
 
-    topk = cfg.model.get("topk_experts", 0)
-    expert_hidden = cfg.model.get("expert_hidden_size", 0)
-    params_per_expert = 3 * n_embd * expert_hidden
+        topk = cfg.model.get("topk_experts", 0)
+        expert_hidden = cfg.model.get("expert_hidden_size", 0)
+        params_per_expert = 3 * n_embd * expert_hidden
+        params_gate = n_embd * cfg.model.get("n_routed_experts", 0)
 
-    params_gate = n_embd * cfg.model.get("n_routed_experts", 0)
+        params_ffn_active = params_shared + params_gate + (topk * params_per_expert)
 
-    params_moe_active = params_shared + params_gate + (topk * params_per_expert)
     params_block_ln = 2 * n_embd
-
-    active_params_per_layer = params_gqa + params_moe_active + params_block_ln
+    active_params_per_layer = params_gqa + params_ffn_active + params_block_ln
     active_body_params = n_layers * active_params_per_layer
 
     l, t = n_layers, cfg.model.block_size
