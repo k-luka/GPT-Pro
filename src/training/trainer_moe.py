@@ -19,13 +19,12 @@ class TrainerConfig:
     run_name: str = "test1"
     batch_size: int = 64
     grad_accum_steps: int = 4
-    batch_warmup_steps: int = 0
     block_size: int = 1024
     max_steps: int = 1000
     warmup_steps: int = 100
-    min_lr: float = 1e-4
+    warmdown_ratio: float = 0.3
     max_lr: float = 6e-4
-    learning_rate: float = 1e-4
+    min_lr: float = 3e-5
     weight_decay: float = 0.1
     logging_steps: int = 1
     checkpoint_interval: int = 1000
@@ -85,27 +84,20 @@ class Trainer:
             fp8_format=self.fp8_format, amax_history_len=16, amax_compute_algo="max"
         )
 
-    def get_grad_accum_steps(self, step):
-        target = self.config.grad_accum_steps
-        if (
-            self.config.batch_warmup_steps <= 0
-            or step >= self.config.batch_warmup_steps
-        ):
-            return target
-        frac = step / self.config.batch_warmup_steps
-        return max(1, round(1 + frac * (target - 1)))
-
     def get_lr(self, it):
+        # WSD: linear warmup → constant → linear warmdown
+        warmdown_start = self.config.max_steps - round(
+            self.config.warmdown_ratio * self.config.max_steps
+        )
         if it < self.config.warmup_steps:
             return self.config.max_lr * it / self.config.warmup_steps
-        if it > self.config.max_steps:
-            return self.config.min_lr
-        decay_ratio = (it - self.config.warmup_steps) / (
-            self.config.max_steps - self.config.warmup_steps
-        )
-        assert 0 <= decay_ratio <= 1
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-        return self.config.min_lr + coeff * (self.config.max_lr - self.config.min_lr)
+        elif it < warmdown_start:
+            return self.config.max_lr
+        else:
+            progress = (self.config.max_steps - it) / (
+                self.config.max_steps - warmdown_start
+            )
+            return self.config.min_lr + progress * (self.config.max_lr - self.config.min_lr)
 
     def _prefetch(self):
         """Prefetch next batch to GPU on a separate CUDA stream."""
@@ -210,15 +202,14 @@ class Trainer:
             lr = self.get_lr(step)
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = lr
-            current_accum = self.get_grad_accum_steps(step)
-            loss = self._train_global_batch(current_accum)
+            loss = self._train_global_batch(self.config.grad_accum_steps)
             torch.cuda.synchronize()
             t1 = time.time()
             dt = t1 - t0
             tps = (
                 self.train_loader.B
                 * self.train_loader.T
-                * current_accum
+                * self.config.grad_accum_steps
                 * self.world_size
             ) / dt
 

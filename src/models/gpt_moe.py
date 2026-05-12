@@ -643,13 +643,14 @@ class GPT(nn.Module):
             if self.rank == 0:
                 self._log_moe_stats()
 
+        logits = self.lm_head(x).float()
+        logits = 30.0 * torch.tanh(logits / 30.0)  # soft-cap to prevent logit explosion
+
         if targets is not None:
-            logits = self.lm_head(x)
             B, T, C = logits.shape
             loss = F.cross_entropy(logits.view(B * T, C), targets.view(B * T))
             return None, loss
         else:
-            logits = self.lm_head(x)
             return logits, None
 
     def generate(

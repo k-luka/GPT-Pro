@@ -27,7 +27,6 @@ data:
 training:
   batch_size: 8
   grad_accum_steps: 8
-  batch_warmup_steps: 1000
 
   # Logistics
   logging_steps: 1
@@ -41,6 +40,7 @@ training:
   # Optimization
   max_steps: 160000
   warmup_steps: 2000
+  warmdown_ratio: 0.3   # last 30% of training: linear decay from max_lr to min_lr
   max_lr: 2.0e-4
   min_lr: 2.0e-5
   weight_decay: 0.1

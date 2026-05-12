@@ -25,7 +25,6 @@ training:
   # tokens/step = batch(4) * grad_accum(16) * block(4096) * world(4 GPUs) = 1,048,576
   batch_size: 4
   grad_accum_steps: 16
-  batch_warmup_steps: 1000
 
   # Logistics
   logging_steps: 100
@@ -39,6 +38,7 @@ training:
   # Optimization
   max_steps: 67000
   warmup_steps: 1000
+  warmdown_ratio: 0.3   # last 30% of training: linear decay from max_lr to min_lr
   max_lr: 3.0e-4
   min_lr: 3.0e-5
   weight_decay: 0.1
