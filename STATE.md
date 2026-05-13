@@ -29,7 +29,9 @@ Two parallel model stacks exist side by side for comparison:
 | Trainer | `src/training/trainer_dense.py` | `src/training/trainer_moe.py` |
 | Entry point | `pretrain_dense.py` | `pretrain_moe.py` |
 | SLURM script | `scripts/run_dense.sh` | `scripts/run_moe.sh` |
-| Config | `config/config_dense.yaml` | `config/config_moe.yaml` / `config_moe_big.yaml` |
+| Config (full) | `config/config_dense.yaml` | `config/config_moe.yaml` / `config_moe_big.yaml` |
+| Config (nano) | `config/config_dense_nano.yaml` | — |
+| Run script (nano) | `scripts/run_dense_nano.sh` | — |
 
 The legacy PyTorch (non-TE) files `src/models/gpt.py` and `src/training/trainer.py` are kept as reference artifacts.
 
@@ -44,6 +46,8 @@ Both stacks share:
 - **Muon + AdamW** dual optimizer
 - **FP8 training** via NVIDIA Transformer Engine
 - **DCP** (PyTorch Distributed Checkpoint) for saving/loading
+- **WSD LR schedule** (linear warmup → constant → linear warmdown)
+- **Logit soft-capping** (`30 * tanh(logits / 30)`) to prevent logit explosion
 
 **Dense stack** uses DDP + `torch.compile`. Simpler, faster to iterate on.
 
@@ -53,13 +57,20 @@ Both stacks share:
 
 ## Pretraining Data
 
-- **Dataset:** ClimbMix-400B
+- **Dataset:** ClimbMix-400B (same dataset used by Karpathy's nanochat)
 - **Location:** `data/climbmix_400b/` (binary uint32 shards, 100M tokens each)
 - **Tokenizer:** DeepSeek-V3-Base (via HuggingFace `transformers`)
+- **Note:** Shards are flat-packed with no document boundary markers. BOS token packing requires re-processing from raw source — deferred.
 
 ---
 
-## Current Model Configs
+## Model Configs
+
+### GatorLM2_nano (Dense) — `config/config_dense_nano.yaml`
+- ~50M params, 8 layers, n_embd=512, 8 Q heads / 4 KV heads, block_size=1024
+- 4 GPUs, 40k steps
+- **Purpose:** fast iteration on pretraining quality — perfect this before scaling up
+- Status: **ready to run**
 
 ### GatorLM2 (Dense) — `config/config_dense.yaml`
 - ~3.5B params, 27 layers, n_embd=4096, 16 Q heads / 4 KV heads, ffn_hidden_size=5632
@@ -78,26 +89,53 @@ Both stacks share:
 
 ---
 
+## What Has Been Done
+
+### Architecture
+- [x] GQA with RoPE and per-head Q/K RMSNorm
+- [x] SwiGLU MLP (dense) and MoE with shared + routed experts
+- [x] Expert parallelism via all-to-all (MoE)
+- [x] Aux-loss-free MoE load balancing via gate bias correction
+- [x] FP8 training via Transformer Engine
+- [x] Muon + AdamW dual optimizer
+- [x] WSD LR schedule (warmup → stable → linear warmdown)
+- [x] Logit soft-capping (30 * tanh(x / 30))
+- [x] DCP distributed checkpointing with best-val tracking
+
+### Infrastructure
+- [x] Two separate stacks (dense / MoE) runnable from separate scripts — no commenting/uncommenting
+- [x] Nano config for fast iteration (`config_dense_nano.yaml`, `run_dense_nano.sh`)
+- [x] ClimbMix-400B tokenized and sharded
+- [x] SLURM scripts for single-node (4 GPU) and multi-node runs
+- [x] W&B logging, HellaSwag eval during training
+- [x] Conda env fixed after path migration to `/blue/pinaki.sarder/`
+
+---
+
 ## Training Stages — TODO
 
-### Stage 1: Pretraining ✅ (code ready)
-- [x] Dense stack implemented and confirmed working
-- [x] MoE stack implemented (needs test run)
+### Stage 1: Pretraining
+- [x] Dense stack implemented and confirmed working on 4× B200
+- [x] MoE stack implemented (needs test run after reorganization)
+- [ ] **Use nano model to perfect pretraining** (current focus)
+  - [ ] Investigate BOS token packing (document boundaries in ClimbMix shards)
+  - [ ] Evaluate adding value residual (ResFormer) to architecture
+  - [ ] Consider sliding window attention (blocked on flash_attn 3)
 - [ ] Decide dense vs MoE based on throughput comparison
-- [ ] Run full pretraining (~70B tokens for dense, ~100B+ for MoE)
+- [ ] Run full pretraining on full-scale model (~70B tokens for dense)
 
 ### Stage 2: Supervised Fine-Tuning — not started
 - [ ] Assemble SFT dataset (instruction following, conversations, math, coding, safety)
-- [ ] Implement SFT training loop (loss masking on completions only)
+- [ ] Implement SFT training loop with loss masking on completions only
 - [ ] `sft.py` exists but needs updating to match new model/trainer structure
 
 ### Stage 3: Reinforcement Learning — not started
-- [ ] Implement GRPO or similar RL algorithm
+- [ ] Implement GRPO or similar
 - [ ] Define reward signal (math correctness, helpfulness, safety)
 - [ ] Safety-specific RL pass (harmful request refusal, UF policy compliance)
 
 ### Evaluation — partial
-- [x] HellaSwag (runs during training)
+- [x] HellaSwag (runs during training automatically)
 - [ ] Add ARC, MMLU, GSM8K, HumanEval benchmarks
 - [ ] Safety evaluation suite
 
@@ -105,6 +143,7 @@ Both stacks share:
 
 ## Known Issues / Notes
 
-- `flash_attn` 2.x does not compile for B200 (sm_100 Blackwell). TE falls back to its internal attention backend. This is handled by a patch in `transformer_engine/pytorch/attention/.../backends.py`.
-- The conda env was relocated from `/blue/weishao/` to `/blue/pinaki.sarder/`. All paths have been fixed (shebangs, sysconfig, Jupyter kernel).
-- `torch` is pinned to `2.11.0+cu128`, `transformer_engine` to `2.10.0`.
+- `flash_attn` 2.x does not compile for B200 (sm_100 Blackwell). TE falls back to its internal attention backend. Handled by a patch in `transformer_engine/pytorch/attention/.../backends.py`.
+- The conda env was relocated from `/blue/weishao/` to `/blue/pinaki.sarder/`. All paths fixed (shebangs, sysconfig, Jupyter kernel).
+- `torch` pinned to `2.11.0+cu128`, `transformer_engine` to `2.10.0`.
+- Sliding window attention requires flash_attn 3 — not feasible on current setup.
