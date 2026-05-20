@@ -7,7 +7,7 @@ experiment:
   run_name: "LM_Neo_5B"
 
 model:
-  vocab_size: 129024  # DeepSeek V3 vocab size is 128815, padded to multiple of 256 for tensor cores
+  vocab_size: 100352  # cl100k_base vocab 100277, padded to multiple of 256 for tensor cores
   block_size: 4096
   n_embd: 3072
   n_layers: 24

@@ -59,11 +59,8 @@ def _run_training(cfg: DictConfig, device_obj: torch.device, master_rank: bool):
         )
 
     # define tokenizer
-    from transformers import AutoTokenizer
-
-    enc = AutoTokenizer.from_pretrained(
-        "deepseek-ai/DeepSeek-V3-Base", trust_remote_code=True
-    )
+    import tiktoken
+    enc = tiktoken.get_encoding("cl100k_base")
 
     # speed up
     torch.set_float32_matmul_precision("high")
