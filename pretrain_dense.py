@@ -2,6 +2,7 @@ import sys
 import traceback
 import torch
 from src.models.gpt_dense import GPT
+# from src.models.gpt_dense_mhc import GPT  # mHC dense — uncomment to switch
 from src.training.trainer_dense import Trainer, TrainerConfig
 from src.utils.helpers import print_trainable_parameters, estimate_flops
 import hydra

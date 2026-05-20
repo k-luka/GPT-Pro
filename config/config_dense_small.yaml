@@ -1,0 +1,46 @@
+hydra:
+  run:
+    dir: output/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+experiment:
+  project: "GPT_Max"
+  run_name: "dense_small"
+
+model:
+  vocab_size: 100352        # cl100k_base vocab 100277, padded to multiple of 256
+  block_size: 2048
+  n_embd: 1024
+  n_layers: 32
+  n_heads: 16
+  n_kv_heads: 4
+  ffn_hidden_size: 2816     # ~8/3 * n_embd, rounded to multiple of 256
+
+data:
+  train_data_root: "data/climbmix_400b/"
+  val_data_root: "data/climbmix_400b/"
+
+training:
+  # ~460M params
+  # Short run for throughput + convergence comparison only (standard vs mHC toggle)
+  # tokens/step = batch(4) * grad_accum(8) * block(2048) * 4 GPUs = 262,144
+  batch_size: 4
+  grad_accum_steps: 8
+
+  # Logistics
+  logging_steps: 10
+  checkpoint_interval: 5000
+  generation_interval: 10000000
+  eval_interval: 500
+  eval_steps: 20
+  eval_batch_size: 8
+  eval_block_size: 2048
+
+  # Optimization
+  max_steps: 5000
+  warmup_steps: 100
+  warmdown_ratio: 0.2
+  max_lr: 3.0e-4
+  min_lr: 3.0e-5
+  weight_decay: 0.1
+
+# resume_checkpoint: output/checkpoints/dense_small/best_val
