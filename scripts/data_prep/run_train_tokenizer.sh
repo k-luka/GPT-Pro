@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=train_tokenizer
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64gb
-#SBATCH --account=weishao
-#SBATCH --qos=weishao
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16gb
+#SBATCH --account=pinaki.sarder
+#SBATCH --qos=pinaki.sarder
 #SBATCH --partition=hpg-milan
 #SBATCH --time=02:00:00
 #SBATCH --output=output/logs/train_tokenizer.log

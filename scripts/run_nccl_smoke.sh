@@ -4,8 +4,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64gb
-#SBATCH --account=weishao
-#SBATCH --qos=weishao
+#SBATCH --account=pinaki.sarder
+#SBATCH --qos=pinaki.sarder
 #SBATCH --partition=hpg-b200
 #SBATCH --gpus=8
 #SBATCH --time=00:30:00
