@@ -66,10 +66,6 @@ hellaswags = {
     "test": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_test.jsonl",
 }
 
-enc = tiktoken.get_encoding("gpt2")
-eot = enc._special_tokens["<|endoftext|>"]
-
-
 def download(split):
     """Downloads HellaSwag DATA_CACHE_DIR"""
     os.makedirs(DATA_CACHE_DIR, exist_ok=True)
