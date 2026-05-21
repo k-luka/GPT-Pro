@@ -7,7 +7,7 @@ experiment:
   run_name: "dense_3b_mhc"
 
 model:
-  vocab_size: 100352        # cl100k_base vocab 100277, padded to multiple of 256
+  vocab_size: 32256        # cl100k_base vocab 100277, padded to multiple of 256
   block_size: 2048
   n_embd: 3072
   n_layers: 28

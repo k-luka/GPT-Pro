@@ -1,10 +1,10 @@
 """
-Offline data preparation for ClimbMix-400B with the GPT-4 cl100k_base tokenizer.
+Offline data preparation for ClimbMix-400B with the custom 32k BPE tokenizer.
 
 Pipeline:
   1. Stream karpathy/climbmix-400b-shuffle from Hugging Face
-  2. Tokenize every document with the cl100k_base tokenizer (tiktoken)
-  3. Prepend <|endoftext|> (id 100257) before every document as a boundary token
+  2. Tokenize every document with the custom 32k BPE tokenizer
+  3. Prepend <|endoftext|> (id 32000) before every document as a boundary token
   4. Slice the flat token stream into shards whose length is an exact
      multiple of block_size  (no padding, no masking at train time)
   5. Write each shard as a dense uint32 .bin file
@@ -28,31 +28,34 @@ import os
 from typing import Optional
 
 import numpy as np
-import tiktoken
 from datasets import load_dataset
+from tokenizers import Tokenizer
 from tqdm import tqdm
 
 DATASET_NAME = "karpathy/climbmix-400b-shuffle"
 SHARD_SIZE = int(1e8)  # 100M tokens per shard
 CHECKPOINT_FILE = "checkpoint.json"
+TOKENIZER_PATH = "data/tokenizer/tokenizer.json"
 
 EOT_TOKEN = "<|endoftext|>"
-EOT_ID = 100257  # cl100k_base / o200k_base <|endoftext|> id
+EOT_ID = 32000  # custom 32k BPE <|endoftext|> id
 
 # ── multiprocessing worker state ──────────────────────────────────────────────
-_worker_enc: Optional[tiktoken.Encoding] = None
+_worker_enc: Optional[Tokenizer] = None
+_worker_tokenizer_path: Optional[str] = None
 
 
-def _init_worker() -> None:
-    global _worker_enc
-    _worker_enc = tiktoken.get_encoding("cl100k_base")
+def _init_worker(tokenizer_path: str) -> None:
+    global _worker_enc, _worker_tokenizer_path
+    _worker_tokenizer_path = tokenizer_path
+    _worker_enc = Tokenizer.from_file(tokenizer_path)
 
 
 def _tokenize(doc: dict) -> np.ndarray:
     """Prepend <|endoftext|> then tokenize the document body."""
     assert _worker_enc is not None
     tokens = [EOT_ID]
-    tokens.extend(_worker_enc.encode_ordinary(doc["text"]))
+    tokens.extend(_worker_enc.encode(doc["text"]).ids)
     return np.array(tokens, dtype=np.uint32)
 
 
@@ -101,6 +104,8 @@ def main() -> None:
     parser.add_argument("--block_size", type=int, default=4096)
     parser.add_argument("--shard_size", type=int, default=SHARD_SIZE)
     parser.add_argument("--output_dir", type=str, default="data/climbmix_400b")
+    parser.add_argument("--tokenizer", type=str, default=TOKENIZER_PATH,
+                        help="Path to tokenizer.json")
     parser.add_argument("--dataset", type=str, default=DATASET_NAME)
     parser.add_argument(
         "--val_shards",
@@ -139,8 +144,8 @@ def main() -> None:
             print("No checkpoint found — starting from the beginning.")
 
     # ── print config ──────────────────────────────────────────────────────────
-    print(f"Tokenizer     : cl100k_base (tiktoken)")
-    print(f"Vocab size    : 100277  (padded to 100352 for tensor cores)")
+    print(f"Tokenizer     : custom 32k BPE  ({args.tokenizer})")
+    print(f"Vocab size    : 32003  (padded to 32256 for tensor cores)")
     print(f"EOT token     : {EOT_TOKEN!r} id={EOT_ID}  (used as document boundary)")
     print(f"Block size    : {args.block_size}")
     print(f"Shard size    : {args.shard_size:,} tokens")
@@ -161,7 +166,7 @@ def main() -> None:
     token_count = 0
     progress: Optional[tqdm] = None
 
-    with mp.Pool(nprocs, initializer=_init_worker) as pool:
+    with mp.Pool(nprocs, initializer=_init_worker, initargs=(args.tokenizer,)) as pool:
         for tokens in pool.imap(_tokenize, ds, chunksize=16):
             docs_processed += 1
             while len(tokens) > 0:

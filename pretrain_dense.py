@@ -52,8 +52,8 @@ def _run_training(
         )
 
     # define tokenizer
-    import tiktoken
-    enc = tiktoken.get_encoding("cl100k_base")
+    from tokenizers import Tokenizer
+    enc = Tokenizer.from_file("data/tokenizer/tokenizer.json")
 
     # speed up
     torch.set_float32_matmul_precision("high")

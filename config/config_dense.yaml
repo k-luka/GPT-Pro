@@ -7,7 +7,7 @@ experiment:
   run_name: "GatorLM2"
 
 model:
-  vocab_size: 100352        # cl100k_base vocab 100277, padded to multiple of 256
+  vocab_size: 32256        # cl100k_base vocab 100277, padded to multiple of 256
   block_size: 4096
   n_embd: 4096
   n_layers: 27

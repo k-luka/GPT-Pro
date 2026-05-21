@@ -20,4 +20,5 @@ cd /blue/pinaki.sarder/kirill.luka/learning/GPT-Pro
 python scripts/data_prep/prepare_climbmix.py \
   --block_size 4096 \
   --num_workers 16 \
+  --tokenizer data/tokenizer/tokenizer.json \
   --output_dir data/climbmix_400b

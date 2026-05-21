@@ -25,6 +25,7 @@ import time
 import tiktoken
 from datasets import load_dataset
 from tokenizers import AddedToken, Regex, Tokenizer
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel, Sequence, Split
 from tokenizers.trainers import BpeTrainer
@@ -119,6 +120,7 @@ def main() -> None:
         Split(Regex(GPT4_SPLIT_PATTERN), behavior="isolated"),
         ByteLevel(add_prefix_space=False, use_regex=False),
     ])
+    tokenizer.decoder = ByteLevelDecoder()
 
     trainer = BpeTrainer(
         vocab_size=args.vocab_size,

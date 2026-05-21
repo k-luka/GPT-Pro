@@ -217,7 +217,7 @@ class GPT(nn.Module):
         max_tokens=200,
         topk=50,
         chat_mode=False,
-        eos_token=100257,
+        eos_token=32000,
     ):
         idx = torch.repeat_interleave(idx.unsqueeze(0), num_sequences, dim=0)
 
