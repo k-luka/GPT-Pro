@@ -28,16 +28,24 @@ The validation set of HellaSwag has a total of 10,042 examples.
 import os
 import json
 import requests
-import tiktoken
 from tqdm import tqdm
 import torch
-import torch.nn as nn
 from torch.nn import functional as F
-from transformers import GPT2LMHeadModel
 
 # -----------------------------------------------------------------------------
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_CACHE_DIR = os.path.join(PROJECT_ROOT, "data", "hellaswag")
+TOKENIZER_PATH = os.path.join(PROJECT_ROOT, "data", "tokenizer", "tokenizer.json")
+EOT_ID = 32000  # <|endoftext|> in custom 32k BPE tokenizer
+
+_enc = None
+
+def _get_enc():
+    global _enc
+    if _enc is None:
+        from tokenizers import Tokenizer
+        _enc = Tokenizer.from_file(TOKENIZER_PATH)
+    return _enc
 
 
 def download_file(url: str, fname: str, chunk_size=1024):
@@ -87,14 +95,13 @@ def render_example(example):
     data = {"label": label, "ctx_tokens": None, "ending_tokens": []}
 
     # gather up all the tokens
-    ctx_tokens = [eot] + enc.encode(ctx)
+    enc = _get_enc()
+    ctx_tokens = [EOT_ID] + enc.encode(ctx).ids
     data["ctx_tokens"] = ctx_tokens
     tok_rows = []
     mask_rows = []
     for end in endings:
-        end_tokens = enc.encode(
-            " " + end
-        )  # note: prepending " " because GPT-2 tokenizer
+        end_tokens = enc.encode(" " + end).ids  # prepend space for byte-level BPE word boundary
         tok_rows.append(ctx_tokens + end_tokens)
         mask_rows.append([0] * len(ctx_tokens) + [1] * len(end_tokens))
         data["ending_tokens"].append(end_tokens)
