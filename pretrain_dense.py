@@ -2,7 +2,6 @@ import sys
 import traceback
 import torch
 from src.models.gpt_dense import GPT
-# from src.models.gpt_dense_mhc import GPT  # mHC dense — uncomment to switch
 from src.training.trainer_dense import Trainer, TrainerConfig
 from src.utils.helpers import print_trainable_parameters, estimate_flops
 import hydra
@@ -60,6 +59,8 @@ def _run_training(
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.enable_cudnn_sdp(False)  # cuDNN SDPA unsupported on pre-Hopper GPUs
+    torch._dynamo.config.optimize_ddp = False     # don't trace into DDP internals
 
     # Define dense model
     model = GPT(
@@ -70,6 +71,7 @@ def _run_training(
         n_kv_heads=cfg.model.n_kv_heads,
         n_layers=cfg.model.n_layers,
         ffn_hidden_size=cfg.model.ffn_hidden_size,
+        mtp_depth=cfg.model.get("mtp_depth", 0),
         dtype=torch.bfloat16,
     )
     model.to(device_obj)

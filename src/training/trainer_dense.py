@@ -228,7 +228,8 @@ class Trainer:
                 val_loss = val_loss_tensor.item()
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    self.save_checkpoint(val_loss, step, is_best=True)
+                    if step % self.config.checkpoint_interval == 0:
+                        self.save_checkpoint(val_loss, step, is_best=True)
                 hella_acc = evaluate_hella_swag(self.model, self.config.device)
                 if self.rank == 0:
                     if self.wandb_run is not None:
