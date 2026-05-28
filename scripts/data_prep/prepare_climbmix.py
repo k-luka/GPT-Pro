@@ -1,13 +1,14 @@
 """
-Offline data preparation for ClimbMix-400B with the custom 32k BPE tokenizer.
+Offline data preparation for ClimbMix-400B with the custom 64k BPE tokenizer.
 
 Pipeline:
   1. Stream karpathy/climbmix-400b-shuffle from Hugging Face
-  2. Tokenize every document with the custom 32k BPE tokenizer
-  3. Prepend <|endoftext|> (id 32000) before every document as a boundary token
+  2. Tokenize every document with the custom 64k BPE tokenizer
+  3. Prepend <|bos|> (id 65533) before every document as a boundary token
   4. Slice the flat token stream into shards whose length is an exact
      multiple of block_size  (no padding, no masking at train time)
-  5. Write each shard as a dense uint32 .bin file
+  5. Write each shard as a dense uint16 .bin file
+     (vocab fits in 16 bits — halves disk + I/O vs uint32)
 
 Usage:
     python scripts/data_prep/prepare_climbmix.py \
@@ -36,9 +37,11 @@ DATASET_NAME = "karpathy/climbmix-400b-shuffle"
 SHARD_SIZE = int(1e8)  # 100M tokens per shard
 CHECKPOINT_FILE = "checkpoint.json"
 TOKENIZER_PATH = "data/tokenizer/tokenizer.json"
+SHARD_DTYPE = np.uint16  # vocab is 65536 (max id 65535) — fits exactly in uint16
 
-EOT_TOKEN = "<|endoftext|>"
-EOT_ID = 32000  # custom 32k BPE <|endoftext|> id
+BOS_TOKEN = "<|bos|>"
+BOS_ID = 65527  # custom 64k BPE <|bos|> id — document boundary token
+                # (first special, sits right after the 65527 BPE tokens)
 
 # ── multiprocessing worker state ──────────────────────────────────────────────
 _worker_enc: Optional[Tokenizer] = None
@@ -54,9 +57,9 @@ def _init_worker(tokenizer_path: str) -> None:
 def _tokenize(doc: dict) -> np.ndarray:
     """Prepend <|endoftext|> then tokenize the document body."""
     assert _worker_enc is not None
-    tokens = [EOT_ID]
+    tokens = [BOS_ID]
     tokens.extend(_worker_enc.encode(doc["text"]).ids)
-    return np.array(tokens, dtype=np.uint32)
+    return np.array(tokens, dtype=SHARD_DTYPE)
 
 
 # ── shard I/O ─────────────────────────────────────────────────────────────────
@@ -99,7 +102,7 @@ def _load_checkpoint(output_dir: str) -> tuple[int, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Prepare ClimbMix-400B shards with cl100k_base tokenizer"
+        description="Prepare ClimbMix-400B shards with the custom 64k BPE tokenizer"
     )
     parser.add_argument("--block_size", type=int, default=4096)
     parser.add_argument("--shard_size", type=int, default=SHARD_SIZE)
@@ -145,8 +148,8 @@ def main() -> None:
 
     # ── print config ──────────────────────────────────────────────────────────
     print(f"Tokenizer     : custom 32k BPE  ({args.tokenizer})")
-    print(f"Vocab size    : 32003  (padded to 32256 for tensor cores)")
-    print(f"EOT token     : {EOT_TOKEN!r} id={EOT_ID}  (used as document boundary)")
+    print(f"Vocab size    : 65536  (fits exactly in uint16)")
+    print(f"BOS token     : {BOS_TOKEN!r} id={BOS_ID}  (used as document boundary)")
     print(f"Block size    : {args.block_size}")
     print(f"Shard size    : {args.shard_size:,} tokens")
     print(f"Output dir    : {args.output_dir}")
@@ -162,7 +165,7 @@ def main() -> None:
 
     shard_idx = start_shard
     docs_processed = skip_docs
-    buf = np.empty((args.shard_size,), dtype=np.uint32)
+    buf = np.empty((args.shard_size,), dtype=SHARD_DTYPE)
     token_count = 0
     progress: Optional[tqdm] = None
 

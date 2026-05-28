@@ -1,21 +1,20 @@
 """
-Train a custom 32k BPE tokenizer on karpathy/climbmix-400b-shuffle.
+Train a custom 64k BPE tokenizer on karpathy/climbmix-400b-shuffle.
 
-Design follows Karpathy's minbpe (https://github.com/karpathy/minbpe):
+Design follows Karpathy's minbpe / nanochat (https://github.com/karpathy/minbpe):
   - Byte-level BPE: all 256 raw bytes are the initial alphabet, no <unk>
   - GPT-4 regex pre-tokenization: splits text into chunks before merging,
     preventing merges across word/number/punctuation boundaries
   - Special tokens added after BPE training at the top of the vocab
 
-Uses the HuggingFace tokenizers (Rust) backend for speed — training ~1M docs
-takes ~10-20 minutes vs hours for minbpe's pure Python.
+Uses the HuggingFace tokenizers (Rust) backend for speed.
 
-Output:
+Output (default):
   data/tokenizer/tokenizer.json   — load with tokenizers.Tokenizer.from_file()
   data/tokenizer/vocab.txt        — human-readable vocab for inspection
 
-Resulting vocab: 32000 BPE + 3 special = 32003 → set vocab_size: 32256 in config
-(32256 is the next multiple of 256, required for tensor core alignment)
+Resulting vocab: 65527 BPE + 9 special = 65536 → set vocab_size: 65536 in config
+(65536 = 2^16 is already a multiple of 256, max id 65535 fits in uint16 exactly)
 """
 
 import argparse
@@ -33,7 +32,7 @@ from tokenizers.trainers import BpeTrainer
 # ── constants ─────────────────────────────────────────────────────────────────
 
 DATASET = "karpathy/climbmix-400b-shuffle"
-DEFAULT_VOCAB_SIZE = 32000   # BPE tokens; 3 special tokens bring total to 32003
+DEFAULT_VOCAB_SIZE = 65527   # BPE tokens; 9 special tokens bring total to 65536 (= 2^16, fits uint16)
 DEFAULT_SAMPLE_DOCS = 1_000_000
 
 # GPT-4 split pattern (from Karpathy's minbpe / tiktoken):
@@ -43,9 +42,22 @@ GPT4_SPLIT_PATTERN = (
     r"""| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 )
 
-# Special tokens — IDs assigned after BPE vocab (starting at vocab_size)
-SPECIAL_TOKENS = ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]
-EOT_TOKEN = "<|endoftext|>"
+# Special tokens — IDs assigned after BPE vocab (starting at vocab_size).
+# Layout follows Karpathy's nanochat: dedicated <|bos|> for document boundaries
+# (pretraining) + sequence start, separate chat-turn tokens for SFT, and
+# python/output pairs reserved for tool-use SFT.
+SPECIAL_TOKENS = [
+    "<|bos|>",
+    "<|user_start|>",
+    "<|user_end|>",
+    "<|assistant_start|>",
+    "<|assistant_end|>",
+    "<|python_start|>",
+    "<|python_end|>",
+    "<|output_start|>",
+    "<|output_end|>",
+]
+BOS_TOKEN = "<|bos|>"
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -85,7 +97,7 @@ def compression_benchmark(tokenizer: Tokenizer, n_docs: int = 500) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train a 32k BPE tokenizer on ClimbMix-400B"
+        description="Train a 64k BPE tokenizer on ClimbMix-400B"
     )
     parser.add_argument("--vocab_size", type=int, default=DEFAULT_VOCAB_SIZE,
                         help="BPE vocab size (special tokens added on top)")
@@ -183,7 +195,7 @@ def main() -> None:
     print("\nDone. To use in training pipeline:")
     print(f"  from tokenizers import Tokenizer")
     print(f"  tok = Tokenizer.from_file('{json_path}')")
-    print(f"  eot_id = tok.token_to_id('<|endoftext|>')  # = {tokenizer.token_to_id(EOT_TOKEN)}")
+    print(f"  bos_id = tok.token_to_id('<|bos|>')  # = {tokenizer.token_to_id(BOS_TOKEN)}")
 
 
 if __name__ == "__main__":

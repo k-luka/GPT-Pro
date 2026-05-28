@@ -33,10 +33,12 @@ import torch
 from torch.nn import functional as F
 
 # -----------------------------------------------------------------------------
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_CACHE_DIR = os.path.join(PROJECT_ROOT, "data", "hellaswag")
-TOKENIZER_PATH = os.path.join(PROJECT_ROOT, "data", "tokenizer", "tokenizer.json")
+TOKENIZER_PATH = os.path.join(PROJECT_ROOT, "data", "tokenizer_32k", "tokenizer.json")
 EOT_ID = 32000  # <|endoftext|> in custom 32k BPE tokenizer
+# NOTE: data/tokenizer/ is now the 64k BPE tokenizer; the 32k one was moved
+# to data/tokenizer_32k/. Update this path + EOT_ID when migrating eval to 64k.
 
 _enc = None
 

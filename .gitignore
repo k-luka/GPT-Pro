@@ -8,4 +8,4 @@ pyrefly.toml
 src/model_practice.py
 LLM_pretrain.log
 LLM_2_pretrain.log
-scripts/data_prep/tokenize_climbmix.log
+scripts/data_prep/*.log
