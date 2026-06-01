@@ -58,20 +58,27 @@ data:
 training:
   # 8 GPUs. Effective batch = batch_size * grad_accum * world_size
   #   = 4 * 16 * 8 = 512 sequences = 512 * 4096 = ~2.1M tokens/step.
-  # NOTE: confirm batch_size=4 fits at 4096 on a B200 (the 8B model fit batch 2;
-  # 5.5B at batch 4 should be ~140GB) and confirm tok/s with a short run before
-  # committing 14 days, then adjust max_steps so tokens ~= throughput * 14 days.
+  # Probed (4 GPU): batch 4 @ 4096 = 126 GB/GPU (fits, ~57 GB headroom). DDP
+  # replicates state, so per-GPU memory is the SAME on 8 GPUs -> batch stays 4.
   batch_size: 4
   grad_accum_steps: 16
 
   logging_steps: 10
-  checkpoint_interval: 2000   # ~22 checkpoints over the run; resume loses <2000 steps
+  # Checkpoints are large (~35 GB each: weights + Muon/AdamW state). Every 5000
+  # steps -> ~11 over the run (~400 GB); prune old step_* dirs as needed (keep
+  # best_val + a couple recent).
+  checkpoint_interval: 5000
   generation_interval: 100000
-  eval_interval: 1000
+  # Eval every 2500 steps -> ~22 evals. Metrics: val loss, val bpb (bits/byte,
+  # vocab-invariant), HellaSwag, and a CORE-style MC suite (ARC-Easy/Challenge +
+  # PIQA), the latter capped at core_max_examples per task for speed.
+  eval_interval: 2500
   eval_steps: 50
   eval_batch_size: 8
   eval_block_size: 4096       # must be <= block_size
   eval_hellaswag: true
+  eval_core: true
+  core_max_examples: 1000
 
   # ~6.5B (35 layers). At ~14.7k tok/s/GPU x 8 GPUs, 14 days @ 85% uptime
   # delivers ~115B tokens; at 2.1M tokens/step that's ~55k steps (~18 tok/param).

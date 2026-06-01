@@ -30,7 +30,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint
 
 from src.datasets.dataloader import DataLoader
-from src.eval.metrics import estimate_loss, evaluate_hella_swag
+from src.eval.metrics import estimate_loss, evaluate_hella_swag, evaluate_core
 
 # DCP loads tensors with torch.load(weights_only=True) (the PyTorch 2.6+ secure
 # default), which refuses to unpickle custom classes unless they are allowlisted.
@@ -95,6 +95,8 @@ class TrainerConfig:
     eval_batch_size: int = 64
     eval_block_size: int = 1024
     eval_hellaswag: bool = True
+    eval_core: bool = False
+    core_max_examples: int = 1000
     device: str = "cuda"
 
 
@@ -147,6 +149,23 @@ class Trainer:
         self.step = 0
         self._prefetch_stream = torch.cuda.Stream()
         self._prefetched = None
+
+        # Average UTF-8 bytes per token on the val set, used to report val_bpb
+        # (bits-per-byte = val_loss_nats / (ln2 * bytes_per_token)) — a
+        # vocab-invariant loss metric (nanochat-style). Computed once from a
+        # sample of the loaded val shard.
+        self.bytes_per_token = None
+        try:
+            from scripts.data_prep.hellaswag import _get_enc
+
+            sample = self.val_loader.tokens[:100000].tolist()
+            text = _get_enc().decode(sample)
+            n_bytes = len(text.encode("utf-8"))
+            if n_bytes > 0:
+                self.bytes_per_token = n_bytes / len(sample)
+        except Exception as e:
+            if self.rank == 0:
+                print(f"[val_bpb] disabled (could not measure bytes/token: {e})")
 
     def get_lr(self, it):
         warmdown_start = self.config.max_steps - round(
@@ -279,18 +298,43 @@ class Trainer:
                     hella_acc = evaluate_hella_swag(
                         self.model, self.config.device, use_autocast=False
                     )
+                core_results = None
+                if self.config.eval_core:
+                    core_results = evaluate_core(
+                        self.model,
+                        self.config.device,
+                        use_autocast=False,
+                        max_examples=self.config.core_max_examples,
+                    )
+                val_bpb = (
+                    val_loss / (math.log(2) * self.bytes_per_token)
+                    if self.bytes_per_token
+                    else None
+                )
                 if self.rank == 0:
                     hella_str = (
                         f"{hella_acc:.4f}" if hella_acc is not None else "skipped"
                     )
+                    bpb_str = f"{val_bpb:.4f}" if val_bpb is not None else "n/a"
+                    core_str = (
+                        f" | CORE: {core_results['core']:.4f}"
+                        if core_results and core_results.get("core") is not None
+                        else ""
+                    )
                     print(
-                        f"Step: {step} | val loss: {val_loss:.6f} | "
-                        f"HellaSwag: {hella_str} | best val: {best_val_loss:.6f}"
+                        f"Step: {step} | val loss: {val_loss:.6f} | val bpb: {bpb_str} | "
+                        f"HellaSwag: {hella_str}{core_str} | best val: {best_val_loss:.6f}"
                     )
                     if self.wandb_run is not None:
                         log_dict = {"val loss": val_loss}
+                        if val_bpb is not None:
+                            log_dict["val bpb"] = val_bpb
                         if hella_acc is not None:
                             log_dict["HellaSwag accuracy"] = hella_acc
+                        if core_results is not None:
+                            for k, v in core_results.items():
+                                if v is not None:
+                                    log_dict[f"core/{k}"] = v
                         self.wandb_run.log(log_dict, step=step)
             if step % self.config.checkpoint_interval == 0:
                 if val_loss is None:

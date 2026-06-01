@@ -179,6 +179,8 @@ def _run_training(
         eval_batch_size=cfg.training.eval_batch_size,
         eval_block_size=cfg.training.eval_block_size,
         eval_hellaswag=cfg.training.get("eval_hellaswag", True),
+        eval_core=cfg.training.get("eval_core", False),
+        core_max_examples=cfg.training.get("core_max_examples", 1000),
         device=str(device_obj),
     )
 

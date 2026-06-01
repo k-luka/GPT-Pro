@@ -54,6 +54,73 @@ def estimate_loss(model, loader, eval_steps, device, use_autocast=True):
 
 
 @torch.no_grad()
+def evaluate_core(model, device, use_autocast=True, max_examples=1000, tasks=None):
+    """CORE-style multiple-choice suite (ARC-Easy/Challenge, PIQA, ...).
+
+    Scores each task like HellaSwag (lowest length-normalized loss wins),
+    DDP-sharded across ranks. Returns {task: acc, ..., "core": mean_acc}.
+    Any task that fails to load (e.g. no network) is skipped (acc=None) so a
+    training run is never crashed by eval.
+    """
+    from scripts.data_prep.core_tasks import TASKS, render_mc
+
+    model.eval()
+    ddp = dist.is_initialized()
+    rank = dist.get_rank() if ddp else 0
+    world = dist.get_world_size() if ddp else 1
+    tasks = tasks or list(TASKS.keys())
+
+    results = {}
+    for task in tasks:
+        n_total = 0
+        n_correct = 0
+        try:
+            # NOTE: iteration is inside the try so a dataset load/parse failure
+            # (e.g. no network) skips the task instead of crashing training.
+            for i, ex in enumerate(TASKS[task]()):
+                if i >= max_examples:
+                    break
+                if i % world != rank:  # shard across ranks
+                    continue
+                tokens, mask, label = render_mc(
+                    ex["context"], ex["choices"], ex["label"]
+                )
+                tokens = tokens.to(device)
+                mask = mask.to(device)
+                with _autocast_ctx(device, use_autocast):
+                    logits, _ = model(tokens)
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_tokens = tokens[..., 1:].contiguous()
+                losses = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_tokens.view(-1),
+                    reduction="none",
+                ).view(tokens.size(0), -1)
+                shift_mask = mask[..., 1:].contiguous()
+                div = shift_mask.sum(dim=1)
+                div[div == 0] = 1.0
+                avg_loss = (losses * shift_mask).sum(dim=1) / div
+                n_total += 1
+                n_correct += int(avg_loss.argmin().item() == label)
+        except Exception as e:  # load/parse failed -> skip, don't crash training
+            if rank == 0:
+                print(f"[eval_core] skipping {task}: {e}")
+            results[task] = None
+            continue
+
+        if ddp:
+            stats = torch.tensor([n_total, n_correct], dtype=torch.long, device=device)
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            n_total, n_correct = stats[0].item(), stats[1].item()
+        results[task] = (n_correct / n_total) if n_total > 0 else None
+
+    valid = [v for v in results.values() if v is not None]
+    results["core"] = (sum(valid) / len(valid)) if valid else None
+    model.train()
+    return results
+
+
+@torch.no_grad()
 def evaluate_hella_swag(model, device, use_autocast=True):
     """
     Evaluates HellaSwag accuracy using the model.
