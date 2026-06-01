@@ -131,12 +131,18 @@ class GPT(nn.Module):
         global_attn_every_n=0,
         mtp_depth=0,
         mtp_lambda=0.3,
+        rope_p=1.0,
     ):
         super().__init__()
         self.dtype = dtype
         self.block_size = block_size
         self.n_embd = n_embd
         self.n_layers = n_layers
+        # p-RoPE (Gemma): rotate only the first `rope_p` fraction of frequency
+        # pairs (the high-frequency, position-carrying ones); leave the
+        # low-frequency tail un-rotated so it can encode semantics. rope_p=1.0
+        # is standard full RoPE.
+        self.rope_p = rope_p
         # DeepSeek-V3 Multi-Token Prediction: `mtp_depth` sequential modules that
         # predict the 2nd..(mtp_depth+1)-th future tokens during training, weighted
         # by `mtp_lambda`. Training-only (eval/generate use the main head only).
@@ -165,7 +171,7 @@ class GPT(nn.Module):
         self._local_block_masks = {}
 
         head_dim = n_embd // n_heads
-        sin, cos = self._precompute_rotary_embeddings(block_size, head_dim)
+        sin, cos = self._precompute_rotary_embeddings(block_size, head_dim, rope_p=rope_p)
         self.register_buffer("sin", sin, persistent=False)
         self.register_buffer("cos", cos, persistent=False)
         self.transformer = nn.ModuleList(
@@ -423,13 +429,23 @@ class GPT(nn.Module):
 
         return DualOptimizer(adam_opt, muon_opt)
 
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
+    def _precompute_rotary_embeddings(
+        self, seq_len, head_dim, base=10000, rope_p=1.0, device=None
+    ):
         if device is None:
             device = self.wte.weight.device
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
         inv_freq = 1.0 / (base ** (channel_range / head_dim))
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        freqs = torch.outer(t, inv_freq)
+        freqs = torch.outer(t, inv_freq)  # (seq_len, head_dim/2)
+        # p-RoPE: zero the rotation angle for the low-frequency tail pairs so
+        # they pass through unchanged (sin(0)=0, cos(0)=1 -> identity). Only the
+        # first n_rot = round(rope_p * head_dim/2) high-frequency pairs rotate.
+        if rope_p < 1.0:
+            n_pairs = inv_freq.shape[0]
+            n_rot = max(1, int(round(rope_p * n_pairs)))
+            if n_rot < n_pairs:
+                freqs[:, n_rot:] = 0.0
         freqs = torch.cat((freqs, freqs), dim=-1)
         sin, cos = freqs.sin(), freqs.cos()
         sin, cos = sin.bfloat16(), cos.bfloat16()

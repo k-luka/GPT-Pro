@@ -1,0 +1,87 @@
+hydra:
+  run:
+    dir: output/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+experiment:
+  project: "GPT_Max"
+  run_name: "dense_6p5b"
+
+# ============================================================================
+# ~6.5B dense pretraining config — sized for 8x B200 over ~14 days.
+#
+# SIZING: measured throughput gives 8 GPUs x 14 days ~= 115-135B tokens. At
+# 6.5B that's ~18 tok/param (near Chinchilla-optimal); 5.5B would be ~24
+# (overtrained, also fine), 7B ~15 (undertrained). 6.5B grows the 5.5B base by
+# DEPTH only (30 -> 35 layers), so head_dim/GQA/attention are unchanged.
+#
+# Param count (vocab 65536, head_dim 128, SwiGLU FFN, weight-tied lm_head):
+#   embed (tied)         = 65536 * 4096                      = 268.4M
+#   per layer attention  = 2*(4096^2) + 2*(4096*1024)        = 41.9M
+#   per layer FFN        = 3 * 4096 * 11008                   = 135.3M
+#   per layer total                                          = 177.2M
+#   35 layers                                                = 6202.6M
+#   TOTAL                                                     ~= 6.47B
+#
+# Architecture decisions (settled by this week's experiments):
+#   - FULL attention (sliding_window/global_attn_every_n = 0). Window attention
+#     gave no speed/memory benefit at block_size <= 8k on this stack.
+#   - NO MTP (mtp_depth = 0). Training cost not worth it at this scale; only keep
+#     it if you later want a speculative-decoding draft head for inference.
+#   - Prenorm RMSNorm (sandwich norm slightly hurt val loss).
+#   - GQA 32 query / 8 KV heads, RoPE, SwiGLU, MXFP8 (torchao), Muon+AdamW.
+#   - WSD-style schedule (warmup -> stable -> warmdown_ratio decay).
+# ============================================================================
+
+model:
+  vocab_size: 65536         # custom 64k BPE, exact 2^16 (fits uint16)
+  block_size: 4096          # 4096 pretrain length (full docs; ~free vs 2048)
+  n_embd: 4096
+  n_layers: 35
+  n_heads: 32               # head_dim = 4096 / 32 = 128
+  n_kv_heads: 8             # GQA: 8 KV heads
+  ffn_hidden_size: 11008    # SwiGLU, ~8/3 * n_embd, multiple of 256
+  # Full attention: both 0 disables locality (all layers global).
+  sliding_window: 0
+  global_attn_every_n: 0
+  # MTP off for training (see header).
+  mtp_depth: 0
+  mtp_lambda: 0.3
+  # p-RoPE (Gemma): rotate only the first 25% of frequency pairs (high-freq,
+  # position-carrying); leave the low-freq tail un-rotated for semantics.
+  # 1.0 = standard full RoPE.
+  rope_p: 0.25
+ 
+data:
+  train_data_root: "data/climbmix_400b_64k/"
+  val_data_root: "data/climbmix_400b_64k/"
+
+training:
+  # 8 GPUs. Effective batch = batch_size * grad_accum * world_size
+  #   = 4 * 16 * 8 = 512 sequences = 512 * 4096 = ~2.1M tokens/step.
+  # NOTE: confirm batch_size=4 fits at 4096 on a B200 (the 8B model fit batch 2;
+  # 5.5B at batch 4 should be ~140GB) and confirm tok/s with a short run before
+  # committing 14 days, then adjust max_steps so tokens ~= throughput * 14 days.
+  batch_size: 4
+  grad_accum_steps: 16
+
+  logging_steps: 10
+  checkpoint_interval: 2000   # ~22 checkpoints over the run; resume loses <2000 steps
+  generation_interval: 100000
+  eval_interval: 1000
+  eval_steps: 50
+  eval_batch_size: 8
+  eval_block_size: 4096       # must be <= block_size
+  eval_hellaswag: true
+
+  # ~6.5B (35 layers). At ~14.7k tok/s/GPU x 8 GPUs, 14 days @ 85% uptime
+  # delivers ~115B tokens; at 2.1M tokens/step that's ~55k steps (~18 tok/param).
+  # Re-tune after the throughput check so the run lands at ~14 days.
+  max_steps: 55000
+  warmup_steps: 1000
+  warmdown_ratio: 0.2         # WSD: decay LR over the final 20% of steps
+  # PLACEHOLDER LRs — set these from the proxy LR sweep before launching.
+  max_lr: 3.0e-4
+  min_lr: 3.0e-5
+  weight_decay: 0.1
+
+# resume_checkpoint: output/checkpoints/dense_6p5b/step_XXXXX

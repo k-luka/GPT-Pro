@@ -94,6 +94,8 @@ def _run_training(
         # DeepSeek-V3 multi-token prediction (training-only auxiliary heads).
         mtp_depth=cfg.model.get("mtp_depth", 0),
         mtp_lambda=cfg.model.get("mtp_lambda", 0.3),
+        # p-RoPE (Gemma): fraction of frequency pairs that get rotated (1.0=full).
+        rope_p=cfg.model.get("rope_p", 1.0),
         dtype=torch.bfloat16,
     )
     model.to(device_obj)
