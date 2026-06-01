@@ -32,7 +32,9 @@ from tokenizers.trainers import BpeTrainer
 # ── constants ─────────────────────────────────────────────────────────────────
 
 DATASET = "karpathy/climbmix-400b-shuffle"
-DEFAULT_VOCAB_SIZE = 65527   # BPE tokens; 9 special tokens bring total to 65536 (= 2^16, fits uint16)
+DEFAULT_VOCAB_SIZE = (
+    65527  # BPE tokens; 9 special tokens bring total to 65536 (= 2^16, fits uint16)
+)
 DEFAULT_SAMPLE_DOCS = 1_000_000
 
 # GPT-4 split pattern (from Karpathy's minbpe / tiktoken):
@@ -62,6 +64,7 @@ BOS_TOKEN = "<|bos|>"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+
 def text_iterator(n_docs: int):
     """Stream raw text from ClimbMix, yielding one document at a time."""
     ds = load_dataset(DATASET, split="train", streaming=True)
@@ -87,25 +90,43 @@ def compression_benchmark(tokenizer: Tokenizer, n_docs: int = 500) -> None:
         cl_tokens += len(cl100k.encode_ordinary(text))
 
     print(f"  Bytes sampled       : {total_bytes:>12,}")
-    print(f"  Custom 32k  tokens  : {custom_tokens:>12,}  ({custom_tokens/total_bytes:.4f} tok/byte)")
-    print(f"  cl100k_base tokens  : {cl_tokens:>12,}  ({cl_tokens/total_bytes:.4f} tok/byte)")
+    print(
+        f"  Custom 32k  tokens  : {custom_tokens:>12,}  ({custom_tokens/total_bytes:.4f} tok/byte)"
+    )
+    print(
+        f"  cl100k_base tokens  : {cl_tokens:>12,}  ({cl_tokens/total_bytes:.4f} tok/byte)"
+    )
     ratio = cl_tokens / custom_tokens
-    print(f"  Compression ratio   : {ratio:.3f}x  ({'better' if ratio > 1 else 'worse'} than cl100k)")
+    print(
+        f"  Compression ratio   : {ratio:.3f}x  ({'better' if ratio > 1 else 'worse'} than cl100k)"
+    )
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train a 64k BPE tokenizer on ClimbMix-400B"
     )
-    parser.add_argument("--vocab_size", type=int, default=DEFAULT_VOCAB_SIZE,
-                        help="BPE vocab size (special tokens added on top)")
-    parser.add_argument("--sample_docs", type=int, default=DEFAULT_SAMPLE_DOCS,
-                        help="Number of ClimbMix documents to sample for training")
+    parser.add_argument(
+        "--vocab_size",
+        type=int,
+        default=DEFAULT_VOCAB_SIZE,
+        help="BPE vocab size (special tokens added on top)",
+    )
+    parser.add_argument(
+        "--sample_docs",
+        type=int,
+        default=DEFAULT_SAMPLE_DOCS,
+        help="Number of ClimbMix documents to sample for training",
+    )
     parser.add_argument("--output_dir", type=str, default="data/tokenizer")
-    parser.add_argument("--skip_benchmark", action="store_true",
-                        help="Skip compression benchmark after training")
+    parser.add_argument(
+        "--skip_benchmark",
+        action="store_true",
+        help="Skip compression benchmark after training",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -118,8 +139,10 @@ def main() -> None:
     print(f"  Sample docs  : {args.sample_docs:,}")
     print(f"  BPE vocab    : {args.vocab_size:,}")
     print(f"  Special toks : {SPECIAL_TOKENS}")
-    print(f"  Total vocab  : {args.vocab_size + len(SPECIAL_TOKENS):,}  "
-          f"(padded to {padded_vocab:,} for tensor cores)")
+    print(
+        f"  Total vocab  : {args.vocab_size + len(SPECIAL_TOKENS):,}  "
+        f"(padded to {padded_vocab:,} for tensor cores)"
+    )
     print(f"  Output dir   : {args.output_dir}")
     print("=" * 60)
 
@@ -128,10 +151,12 @@ def main() -> None:
 
     # Pre-tokenizer: GPT-4 regex split → then byte-level encoding within each chunk.
     # This matches Karpathy's minbpe RegexTokenizer design exactly.
-    tokenizer.pre_tokenizer = Sequence([
-        Split(Regex(GPT4_SPLIT_PATTERN), behavior="isolated"),
-        ByteLevel(add_prefix_space=False, use_regex=False),
-    ])
+    tokenizer.pre_tokenizer = Sequence(
+        [
+            Split(Regex(GPT4_SPLIT_PATTERN), behavior="isolated"),
+            ByteLevel(add_prefix_space=False, use_regex=False),
+        ]
+    )
     tokenizer.decoder = ByteLevelDecoder()
 
     trainer = BpeTrainer(
@@ -162,7 +187,9 @@ def main() -> None:
     print("\nSpecial token IDs:")
     for tok in SPECIAL_TOKENS:
         print(f"  {tok:<20} → {tokenizer.token_to_id(tok)}")
-    print(f"\nTotal vocab size: {tokenizer.get_vocab_size():,}  (set vocab_size: {padded_vocab} in config)")
+    print(
+        f"\nTotal vocab size: {tokenizer.get_vocab_size():,}  (set vocab_size: {padded_vocab} in config)"
+    )
 
     # ── save ──────────────────────────────────────────────────────────────────
     json_path = os.path.join(args.output_dir, "tokenizer.json")
@@ -195,7 +222,9 @@ def main() -> None:
     print("\nDone. To use in training pipeline:")
     print(f"  from tokenizers import Tokenizer")
     print(f"  tok = Tokenizer.from_file('{json_path}')")
-    print(f"  bos_id = tok.token_to_id('<|bos|>')  # = {tokenizer.token_to_id(BOS_TOKEN)}")
+    print(
+        f"  bos_id = tok.token_to_id('<|bos|>')  # = {tokenizer.token_to_id(BOS_TOKEN)}"
+    )
 
 
 if __name__ == "__main__":

@@ -97,7 +97,9 @@ class Trainer:
             progress = (self.config.max_steps - it) / (
                 self.config.max_steps - warmdown_start
             )
-            return self.config.min_lr + progress * (self.config.max_lr - self.config.min_lr)
+            return self.config.min_lr + progress * (
+                self.config.max_lr - self.config.min_lr
+            )
 
     def _prefetch(self):
         """Prefetch next batch to GPU on a separate CUDA stream."""

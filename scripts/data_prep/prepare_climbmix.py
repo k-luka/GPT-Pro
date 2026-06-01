@@ -41,7 +41,7 @@ SHARD_DTYPE = np.uint16  # vocab is 65536 (max id 65535) — fits exactly in uin
 
 BOS_TOKEN = "<|bos|>"
 BOS_ID = 65527  # custom 64k BPE <|bos|> id — document boundary token
-                # (first special, sits right after the 65527 BPE tokens)
+# (first special, sits right after the 65527 BPE tokens)
 
 # ── multiprocessing worker state ──────────────────────────────────────────────
 _worker_enc: Optional[Tokenizer] = None
@@ -107,8 +107,9 @@ def main() -> None:
     parser.add_argument("--block_size", type=int, default=4096)
     parser.add_argument("--shard_size", type=int, default=SHARD_SIZE)
     parser.add_argument("--output_dir", type=str, default="data/climbmix_400b")
-    parser.add_argument("--tokenizer", type=str, default=TOKENIZER_PATH,
-                        help="Path to tokenizer.json")
+    parser.add_argument(
+        "--tokenizer", type=str, default=TOKENIZER_PATH, help="Path to tokenizer.json"
+    )
     parser.add_argument("--dataset", type=str, default=DATASET_NAME)
     parser.add_argument(
         "--val_shards",
@@ -142,7 +143,9 @@ def main() -> None:
     if args.resume:
         start_shard, skip_docs = _load_checkpoint(args.output_dir)
         if skip_docs > 0:
-            print(f"Resuming from shard {start_shard}, skipping {skip_docs:,} documents …")
+            print(
+                f"Resuming from shard {start_shard}, skipping {skip_docs:,} documents …"
+            )
         else:
             print("No checkpoint found — starting from the beginning.")
 

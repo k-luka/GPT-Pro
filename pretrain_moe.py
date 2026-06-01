@@ -60,6 +60,7 @@ def _run_training(cfg: DictConfig, device_obj: torch.device, master_rank: bool):
 
     # define tokenizer
     from tokenizers import Tokenizer
+
     enc = Tokenizer.from_file("data/tokenizer/tokenizer.json")
 
     # speed up

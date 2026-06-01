@@ -1,3 +1,4 @@
+import contextlib
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -6,8 +7,23 @@ import sys
 from scripts.data_prep.hellaswag import iterate_examples, render_example
 
 
+def _autocast_ctx(device, use_autocast):
+    """bf16 autocast for the TE stack; a no-op for torchao MXFP8.
+
+    The torchao MXFP8 kernels only accept bf16 inputs, and the model is already
+    pure bf16, so wrapping its forward in torch.autocast (which keeps RMSNorm in
+    fp32) feeds float32 into the MXFP8 GEMM and crashes. Pass use_autocast=False
+    from the torchao trainer to mirror its (autocast-free) training path.
+    """
+    if not use_autocast:
+        return contextlib.nullcontext()
+    return torch.autocast(
+        device_type="cuda" if "cuda" in str(device) else "cpu", dtype=torch.bfloat16
+    )
+
+
 @torch.no_grad()
-def estimate_loss(model, loader, eval_steps, device):
+def estimate_loss(model, loader, eval_steps, device, use_autocast=True):
     """
     Estimates the loss on the validation set.
     """
@@ -26,10 +42,7 @@ def estimate_loss(model, loader, eval_steps, device):
         X = X.to(device)
         Y = Y.to(device)
 
-        # Use autocast if using cuda/bfloat16
-        with torch.autocast(
-            device_type="cuda" if "cuda" in str(device) else "cpu", dtype=torch.bfloat16
-        ):
+        with _autocast_ctx(device, use_autocast):
             # Model forward pass
             _, loss = model(X, Y)
 
@@ -41,7 +54,7 @@ def estimate_loss(model, loader, eval_steps, device):
 
 
 @torch.no_grad()
-def evaluate_hella_swag(model, device):
+def evaluate_hella_swag(model, device, use_autocast=True):
     """
     Evaluates HellaSwag accuracy using the model.
     """
@@ -79,9 +92,7 @@ def evaluate_hella_swag(model, device):
         mask = mask.to(device)
 
         # Forward pass
-        with torch.autocast(
-            device_type="cuda" if "cuda" in str(device) else "cpu", dtype=torch.bfloat16
-        ):
+        with _autocast_ctx(device, use_autocast):
             logits, _ = model(tokens)
 
         # Logits shape: (4, Seq_Len, Vocab)

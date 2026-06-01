@@ -33,19 +33,21 @@ import torch
 from torch.nn import functional as F
 
 # -----------------------------------------------------------------------------
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 DATA_CACHE_DIR = os.path.join(PROJECT_ROOT, "data", "hellaswag")
-TOKENIZER_PATH = os.path.join(PROJECT_ROOT, "data", "tokenizer_32k", "tokenizer.json")
-EOT_ID = 32000  # <|endoftext|> in custom 32k BPE tokenizer
-# NOTE: data/tokenizer/ is now the 64k BPE tokenizer; the 32k one was moved
-# to data/tokenizer_32k/. Update this path + EOT_ID when migrating eval to 64k.
+TOKENIZER_PATH = os.path.join(PROJECT_ROOT, "data", "tokenizer", "tokenizer.json")
+EOT_ID = 65527  # <|bos|> in custom 64k BPE tokenizer (used as sequence boundary)
 
 _enc = None
+
 
 def _get_enc():
     global _enc
     if _enc is None:
         from tokenizers import Tokenizer
+
         _enc = Tokenizer.from_file(TOKENIZER_PATH)
     return _enc
 
@@ -67,6 +69,7 @@ hellaswags = {
     "val": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl",
     "test": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_test.jsonl",
 }
+
 
 def download(split):
     """Downloads HellaSwag DATA_CACHE_DIR"""
@@ -99,7 +102,9 @@ def render_example(example):
     tok_rows = []
     mask_rows = []
     for end in endings:
-        end_tokens = enc.encode(" " + end).ids  # prepend space for byte-level BPE word boundary
+        end_tokens = enc.encode(
+            " " + end
+        ).ids  # prepend space for byte-level BPE word boundary
         tok_rows.append(ctx_tokens + end_tokens)
         mask_rows.append([0] * len(ctx_tokens) + [1] * len(end_tokens))
         data["ending_tokens"].append(end_tokens)

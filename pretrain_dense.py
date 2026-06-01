@@ -53,14 +53,17 @@ def _run_training(
 
     # define tokenizer
     from tokenizers import Tokenizer
+
     enc = Tokenizer.from_file("data/tokenizer/tokenizer.json")
 
     # speed up
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cuda.enable_cudnn_sdp(False)  # cuDNN SDPA unsupported on pre-Hopper GPUs
-    torch._dynamo.config.optimize_ddp = False     # don't trace into DDP internals
+    torch.backends.cuda.enable_cudnn_sdp(
+        False
+    )  # cuDNN SDPA unsupported on pre-Hopper GPUs
+    torch._dynamo.config.optimize_ddp = False  # don't trace into DDP internals
 
     # Define dense model
     model = GPT(
@@ -71,7 +74,7 @@ def _run_training(
         n_kv_heads=cfg.model.n_kv_heads,
         n_layers=cfg.model.n_layers,
         ffn_hidden_size=cfg.model.ffn_hidden_size,
-        mtp_depth=cfg.model.get("mtp_depth", 0),
+        # mtp_depth=cfg.model.get("mtp_depth", 0),
         dtype=torch.bfloat16,
     )
     model.to(device_obj)

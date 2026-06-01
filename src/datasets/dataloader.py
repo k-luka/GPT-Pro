@@ -4,8 +4,8 @@ import torch
 
 
 def load_tokens(filename: str) -> torch.Tensor:
-    """Load a dense uint32 .bin shard into a long tensor."""
-    tokens = np.fromfile(filename, dtype=np.uint32)
+    """Load a dense uint16 .bin shard into a long tensor."""
+    tokens = np.fromfile(filename, dtype=np.uint16)
     return torch.from_numpy(tokens.astype(np.int64))
 
 
@@ -13,7 +13,7 @@ class DataLoader:
     """
     Reads pre-packed .bin shards produced by prepare_climbmix.py.
 
-    Each shard is a flat uint32 token stream whose length is an exact
+    Each shard is a flat uint16 token stream whose length is an exact
     multiple of block_size, so no padding or masking is needed.
     """
 
@@ -47,7 +47,7 @@ class DataLoader:
         )
 
         for shard_idx, shard_path in enumerate(self.shards):
-            shard_len = os.path.getsize(shard_path) // np.dtype(np.uint32).itemsize
+            shard_len = os.path.getsize(shard_path) // np.dtype(np.uint16).itemsize
             if offset < shard_len:
                 self.current_shard = shard_idx
                 self.tokens = load_tokens(self.shards[self.current_shard])

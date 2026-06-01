@@ -95,9 +95,7 @@ class Block(nn.Module):
         self.mlp = MLP(n_embd, hidden_size=ffn_hidden_size, dtype=dtype)
 
     def forward(self, x, sin, cos, is_first_microbatch=None):
-        x = x + self.sa(
-            self.ln1(x), sin, cos, is_first_microbatch=is_first_microbatch
-        )
+        x = x + self.sa(self.ln1(x), sin, cos, is_first_microbatch=is_first_microbatch)
         x = x + self.mlp(self.ln2(x), is_first_microbatch=is_first_microbatch)
         return x
 
@@ -113,14 +111,14 @@ class GPT(nn.Module):
         n_layers,
         ffn_hidden_size,
         dtype,
-        mtp_depth=0,
+        # mtp_depth=0,
     ):
         super().__init__()
         self.dtype = dtype
         self.block_size = block_size
         self.n_embd = n_embd
         self.n_layers = n_layers
-        self.mtp_depth = mtp_depth
+        # self.mtp_depth = mtp_depth
         self.wte = nn.Embedding(vocab_size, n_embd, dtype=dtype)
 
         head_dim = n_embd // n_heads
@@ -144,13 +142,16 @@ class GPT(nn.Module):
         self.wte.weight = self.lm_head.weight  # weight tying
 
         # Multi-Token Prediction heads: each predicts one additional future token
-        if mtp_depth > 0:
-            self.mtp_norms = nn.ModuleList(
-                [nn.RMSNorm(n_embd, dtype=dtype) for _ in range(mtp_depth)]
-            )
-            self.mtp_projs = nn.ModuleList(
-                [nn.Linear(n_embd, n_embd, bias=False, dtype=dtype) for _ in range(mtp_depth)]
-            )
+        # if mtp_depth > 0:
+        #     self.mtp_norms = nn.ModuleList(
+        #         [nn.RMSNorm(n_embd, dtype=dtype) for _ in range(mtp_depth)]
+        #     )
+        #     self.mtp_projs = nn.ModuleList(
+        #         [
+        #             nn.Linear(n_embd, n_embd, bias=False, dtype=dtype)
+        #             for _ in range(mtp_depth)
+        #         ]
+        #     )
 
         self.apply(self._init_weights)
         self.rank = dist.get_rank()
@@ -188,23 +189,23 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(B * T, C), targets.view(B * T))
 
             # MTP auxiliary loss: only during training, not eval
-            if self.mtp_depth > 0 and self.training:
-                mtp_loss = 0.0
-                h = x
-                for k in range(self.mtp_depth):
-                    # residual projection to simulate one more prediction step
-                    h = h + self.mtp_projs[k](self.mtp_norms[k](h))
-                    aux_logits = self.lm_head(h).float()
-                    aux_logits = 30.0 * torch.tanh(aux_logits / 30.0)
-                    # head k predicts k+2 steps ahead; targets already shifted by 1
-                    shift = k + 1
-                    valid_T = T - shift
-                    if valid_T > 0:
-                        mtp_loss += F.cross_entropy(
-                            aux_logits[:, :valid_T].contiguous().view(-1, C),
-                            targets[:, shift:].contiguous().view(-1),
-                        )
-                loss = loss + 0.3 * mtp_loss / self.mtp_depth
+            # if self.mtp_depth > 0 and self.training:
+            #     mtp_loss = 0.0
+            #     h = x
+            #     for k in range(self.mtp_depth):
+            #         # residual projection to simulate one more prediction step
+            #         h = h + self.mtp_projs[k](self.mtp_norms[k](h))
+            #         aux_logits = self.lm_head(h).float()
+            #         aux_logits = 30.0 * torch.tanh(aux_logits / 30.0)
+            #         # head k predicts k+2 steps ahead; targets already shifted by 1
+            #         shift = k + 1
+            #         valid_T = T - shift
+            #         if valid_T > 0:
+            #             mtp_loss += F.cross_entropy(
+            #                 aux_logits[:, :valid_T].contiguous().view(-1, C),
+            #                 targets[:, shift:].contiguous().view(-1),
+            #             )
+            #     loss = loss + 0.3 * mtp_loss / self.mtp_depth
 
             return None, loss
         else:
