@@ -1,0 +1,54 @@
+hydra:
+  run:
+    dir: output/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+experiment:
+  project: "GPT_Max"
+  run_name: "dense_torchao"
+
+model:
+  vocab_size: 65536         # custom 64k BPE, exact 2^16 (fits uint16)
+  block_size: 2048
+  n_embd: 1536
+  n_layers: 20
+  n_heads: 12
+  n_kv_heads: 4
+  ffn_hidden_size: 4096     # 8/3 * n_embd (exact for 1536), multiple of 256
+  # Gemma-style interleaved attention: global_attn_every_n=5 -> globals at
+  # layers {0,5,10,15,19} (last forced) = 5 global / 15 local of 20. Local layers
+  # use a 1024-token sliding window. Set either to 0 to disable (all-global).
+  sliding_window: 512
+  global_attn_every_n: 5
+  # DeepSeek-V3 multi-token prediction (training-only). mtp_depth=0 disables it;
+  # n predicts the +2..+(n+1) future tokens via n extra transformer blocks.
+  mtp_depth: 0
+  mtp_lambda: 0.3
+
+data:
+  train_data_root: "data/climbmix_400b_64k/"
+  val_data_root: "data/climbmix_400b_64k/"
+
+training:
+  # 1 GPU; effective batch = batch_size * grad_accum = 128.
+  # batch_size 32 (not 64) so the sandwich-norm activations fit in B200 memory;
+  # grad_accum 4 keeps the same effective batch / tokens-per-step.
+  batch_size: 32
+  grad_accum_steps: 4
+
+  logging_steps: 5
+  checkpoint_interval: 5000
+  generation_interval: 100000
+  eval_interval: 500
+  eval_steps: 20
+  eval_batch_size: 8
+  eval_block_size: 2048
+  eval_hellaswag: true     # set false for quick A/B runs (val-loss is the metric)
+
+  max_steps: 20000
+  warmup_steps: 500
+  warmdown_ratio: 0.2
+  max_lr: 3.0e-4
+  min_lr: 3.0e-5
+  weight_decay: 0.1
+
+# resume_checkpoint: output/checkpoints/dense_1b_torchao/best_val
