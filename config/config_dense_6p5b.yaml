@@ -57,21 +57,31 @@ data:
 
 training:
   # 8 GPUs. Effective batch = batch_size * grad_accum * world_size
-  #   = 4 * 16 * 8 = 512 sequences = 512 * 4096 = ~2.1M tokens/step.
-  # Probed (4 GPU): batch 4 @ 4096 = 126 GB/GPU (fits, ~57 GB headroom). DDP
-  # replicates state, so per-GPU memory is the SAME on 8 GPUs -> batch stays 4.
+  #   = 4 * 32 * 8 = 1024 sequences = 1024 * 4096 = ~4.2M tokens/step.
+  # Doubled from 512 (ga=16): bigger batch via grad_accum is free on memory and
+  # ~+3.5% throughput (fewer optimizer steps). batch_size stays 4 (microbatch is
+  # at the ~138 GB memory ceiling; batch>=6 OOMs and >4 gives no speedup -- the
+  # 4096-token GEMMs already saturate the B200). DDP replicates state, so per-GPU
+  # memory is identical on 8 GPUs.
   batch_size: 4
-  grad_accum_steps: 16
+  grad_accum_steps: 32
+  # Accumulate microbatch grads in an fp32 buffer + reduce across ranks in fp32
+  # (cast back to bf16 for the optimizer). Matches OLMo's fp32 grad-reduce; guards
+  # against bf16 accumulation error at high grad_accum. Costs ~26 GB/GPU.
+  fp32_grad_accum: false
 
-  logging_steps: 10
-  # Checkpoints are large (~35 GB each: weights + Muon/AdamW state). Every 5000
-  # steps -> ~11 over the run (~400 GB); prune old step_* dirs as needed (keep
-  # best_val + a couple recent).
+  logging_steps: 20
+  # Checkpoints are ~35 GB each (weights + Muon/AdamW state). checkpoint_interval
+  # is ~one per day (5000 steps ~= 1 day at the measured throughput). Policy
+  # (see trainer): through the first ~2/3 only a SINGLE rolling step_* is kept
+  # (for requeue/crash resume) + best_val; permanent daily archives accumulate
+  # only in the final third (periodic_ckpt_keep_from_frac).
   checkpoint_interval: 5000
+  periodic_ckpt_keep_from_frac: 0.667
   generation_interval: 100000
-  # Eval every 2500 steps -> ~22 evals. Metrics: val loss, val bpb (bits/byte,
-  # vocab-invariant), HellaSwag, and a CORE-style MC suite (ARC-Easy/Challenge +
-  # PIQA), the latter capped at core_max_examples per task for speed.
+  # Eval every 2500 steps -> ~22 evals (~2/day). Metrics: val loss, val bpb
+  # (bits/byte, vocab-invariant), HellaSwag, and a CORE-style MC suite
+  # (ARC-Easy/Challenge + OpenBookQA), capped at core_max_examples/task for speed.
   eval_interval: 2500
   eval_steps: 50
   eval_batch_size: 8
@@ -80,15 +90,19 @@ training:
   eval_core: true
   core_max_examples: 1000
 
-  # ~6.5B (35 layers). At ~14.7k tok/s/GPU x 8 GPUs, 14 days @ 85% uptime
-  # delivers ~115B tokens; at 2.1M tokens/step that's ~55k steps (~18 tok/param).
-  # Re-tune after the throughput check so the run lands at ~14 days.
+  # ~6.5B (35 layers). Measured ~31.5k tok/s/GPU (4-GPU probe, ~55% MFU on B200
+  # FP8); 8 GPUs ~= 235k tok/s after all-reduce/eval overhead -> ~4800 steps/day.
+  # 55k steps @ 4.2M tokens = ~230B tokens (~35 tok/param), finishing in ~11-13
+  # days (conservatively under the 14-day wall, so the WSD decay completes even
+  # if throughput is lower than probed).
   max_steps: 55000
   warmup_steps: 1000
   warmdown_ratio: 0.2         # WSD: decay LR over the final 20% of steps
-  # PLACEHOLDER LRs — set these from the proxy LR sweep before launching.
-  max_lr: 3.0e-4
-  min_lr: 3.0e-5
+  # From the LR sweep at the 4.2M-token batch (lr_sweep_6p5b_4p2m): 6e-4 won a
+  # clean U-shape (3e-4 / 6e-4 / 1.2e-3 -> 4.07 / 3.86 / 4.22 val). Robust across
+  # both 2.1M and 4.2M batches (Muon match_rms damps batch->LR sensitivity).
+  max_lr: 6.0e-4
+  min_lr: 6.0e-5
   weight_decay: 0.1
 
 # resume_checkpoint: output/checkpoints/dense_6p5b/step_XXXXX

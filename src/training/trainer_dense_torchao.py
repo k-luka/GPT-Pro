@@ -97,6 +97,11 @@ class TrainerConfig:
     eval_hellaswag: bool = True
     eval_core: bool = False
     core_max_examples: int = 1000
+    fp32_grad_accum: bool = False
+    # Fraction of training after which periodic step_* checkpoints are kept as
+    # permanent archives. Before it, only a single rolling resume checkpoint is
+    # kept (older ones pruned). best_val is always kept.
+    periodic_ckpt_keep_from_frac: float = 0.667
     device: str = "cuda"
 
 
@@ -201,6 +206,23 @@ class Trainer:
 
         self._prefetch()
 
+        # Optional fp32 gradient accumulation: promote each microbatch's bf16
+        # grad into a persistent fp32 buffer, reduce across ranks in fp32, then
+        # cast the fp32 sum back to bf16 once (single rounding) for the optimizer.
+        # Avoids bf16 accumulation "swamping" over many microbatches and bf16
+        # cross-rank reduction; optimizer still sees bf16 grads (dtype contract
+        # unchanged). Costs one fp32 buffer per param (~4 bytes/param).
+        use_fp32 = getattr(self.config, "fp32_grad_accum", False)
+        if use_fp32:
+            if not hasattr(self, "_fp32_grads"):
+                self._fp32_grads = {
+                    p: torch.zeros_like(p, dtype=torch.float32)
+                    for p in self.model.parameters()
+                    if p.requires_grad
+                }
+            for buf in self._fp32_grads.values():
+                buf.zero_()
+
         for micro_step in range(grad_accum_steps):
             x, y = self._get_prefetched()
             is_last = micro_step == grad_accum_steps - 1
@@ -210,7 +232,12 @@ class Trainer:
 
             torch.compiler.cudagraph_mark_step_begin()
 
-            ctx = contextlib.nullcontext() if is_last else self.model.no_sync()
+            # fp32 path reduces manually after the loop, so never let DDP
+            # auto-sync (keep every microbatch under no_sync).
+            if use_fp32:
+                ctx = self.model.no_sync()
+            else:
+                ctx = contextlib.nullcontext() if is_last else self.model.no_sync()
             with ctx:
                 # No autocast: model params and intermediates are already bf16,
                 # and autocast can upcast through RMSNorm in ways that break the
@@ -219,6 +246,18 @@ class Trainer:
                 loss = loss / grad_accum_steps
                 loss_accum += loss.detach()
                 loss.backward()
+
+            if use_fp32:
+                for p, buf in self._fp32_grads.items():
+                    if p.grad is not None:
+                        buf.add_(p.grad.float())
+                self.optimizer.zero_grad(set_to_none=True)
+
+        if use_fp32:
+            # cross-rank reduction in fp32, then hand bf16 grads to the optimizer
+            for p, buf in self._fp32_grads.items():
+                dist.all_reduce(buf, op=dist.ReduceOp.AVG)
+                p.grad = buf.to(p.dtype)
 
         if hasattr(self.optimizer, "get_adamw_params"):
             torch.nn.utils.clip_grad_norm_(self.optimizer.get_adamw_params(), 1.0)
@@ -291,8 +330,7 @@ class Trainer:
                 val_loss = val_loss_tensor.item()
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    if step % self.config.checkpoint_interval == 0:
-                        self.save_checkpoint(val_loss, step, is_best=True)
+                    self.save_checkpoint(val_loss, step, is_best=True)
                 hella_acc = None
                 if self.config.eval_hellaswag:
                     hella_acc = evaluate_hella_swag(
@@ -336,6 +374,12 @@ class Trainer:
                                 if v is not None:
                                     log_dict[f"core/{k}"] = v
                         self.wandb_run.log(log_dict, step=step)
+            # Periodic step_* checkpoint, written ~once per day (checkpoint_interval).
+            # Policy: through the first part of the run we keep only a SINGLE rolling
+            # checkpoint (older step_* pruned) purely so a requeue/node-failure can
+            # resume without losing days. Permanent daily archives accumulate only
+            # in the final stretch (step >= keep_from_step). best_val is saved
+            # separately on every improvement.
             if step % self.config.checkpoint_interval == 0:
                 if val_loss is None:
                     val_loss = estimate_loss(
@@ -349,6 +393,29 @@ class Trainer:
                     dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
                     val_loss = val_loss_tensor.item()
                 self.save_checkpoint(val_loss, step, is_best=False)
+                keep_from_step = round(
+                    self.config.periodic_ckpt_keep_from_frac * self.config.max_steps
+                )
+                if step < keep_from_step:
+                    self._prune_step_checkpoints(keep_step=step)
+
+    def _prune_step_checkpoints(self, keep_step):
+        """Delete every step_* checkpoint except step_{keep_step} (rank 0 only).
+
+        Used to keep just one rolling resume checkpoint during the early/mid run.
+        """
+        dist.barrier()
+        if self.rank == 0:
+            import glob
+            import shutil
+
+            base = f"output/checkpoints/{self.config.run_name}"
+            keep = os.path.join(base, f"step_{keep_step}")
+            for d in glob.glob(os.path.join(base, "step_*")):
+                if os.path.abspath(d) != os.path.abspath(keep):
+                    shutil.rmtree(d, ignore_errors=True)
+                    print(f"---| Pruned old checkpoint {d} |---")
+        dist.barrier()
 
     def save_checkpoint(self, val_loss, step, is_best=False):
         if is_best:

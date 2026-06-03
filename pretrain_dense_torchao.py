@@ -181,6 +181,10 @@ def _run_training(
         eval_hellaswag=cfg.training.get("eval_hellaswag", True),
         eval_core=cfg.training.get("eval_core", False),
         core_max_examples=cfg.training.get("core_max_examples", 1000),
+        fp32_grad_accum=cfg.training.get("fp32_grad_accum", False),
+        periodic_ckpt_keep_from_frac=cfg.training.get(
+            "periodic_ckpt_keep_from_frac", 0.667
+        ),
         device=str(device_obj),
     )
 
