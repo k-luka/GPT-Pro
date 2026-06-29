@@ -188,6 +188,23 @@ class Trainer:
                 self.config.max_lr - self.config.min_lr
             )
 
+    @staticmethod
+    def _host_mem_gib():
+        """This process's resident (VmRSS) and peak-resident (VmHWM) host memory
+        in GiB, read from /proc/self/status. Used to watch for the slow host-RAM
+        climb that OOM-killed the first big run; cheap enough to call every log."""
+        rss = hwm = 0.0
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        rss = int(line.split()[1]) / (1024 * 1024)  # kB -> GiB
+                    elif line.startswith("VmHWM:"):
+                        hwm = int(line.split()[1]) / (1024 * 1024)
+        except Exception:
+            pass
+        return rss, hwm
+
     def _prefetch(self):
         x, y = next(self.train_loader)
         with torch.cuda.stream(self._prefetch_stream):
@@ -302,6 +319,25 @@ class Trainer:
                 * self.world_size
             ) / dt
 
+            # Host-memory probe (all ranks participate in the collective). Sum of
+            # per-rank VmRSS approximates the cgroup total that the --mem limit
+            # caps; max_rss/peak flags whether any single rank is the outlier.
+            # Logged to W&B only (not printed) to watch the slow host-RAM climb.
+            mem_log = {}
+            if step % self.config.logging_steps == 0:
+                rss, hwm = self._host_mem_gib()
+                m = torch.tensor(
+                    [rss, hwm, rss], device=self.config.device
+                )  # [sum_rss, sum_hwm, max_rss]
+                dist.all_reduce(m[:2], op=dist.ReduceOp.SUM)
+                dist.all_reduce(m[2:], op=dist.ReduceOp.MAX)
+                if self.rank == 0:
+                    mem_log = {
+                        "host RSS sum (GiB)": m[0].item(),
+                        "host RSS peak sum (GiB)": m[1].item(),
+                        "host RSS max-rank (GiB)": m[2].item(),
+                    }
+
             if self.rank == 0:
                 if self.wandb_run is not None:
                     self.wandb_run.log(
@@ -309,6 +345,7 @@ class Trainer:
                             "train loss": float(loss),
                             "tokens/sec": float(tps),
                             "train step time (ms)": dt * 1000,
+                            **mem_log,
                         },
                         step=step,
                     )

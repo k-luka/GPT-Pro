@@ -7,8 +7,8 @@
 #
 #SBATCH --job-name=dense_6p5b
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=512gb
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=300gb
 #SBATCH --account=pinaki.sarder
 #SBATCH --qos=pinaki.sarder
 #SBATCH --partition=hpg-b200
