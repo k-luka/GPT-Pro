@@ -1,0 +1,82 @@
+{
+  "count_metadata": {
+    "documents": 200000,
+    "gemma_tokens": 125667882,
+    "source_tokens": 121250582,
+    "utf8_bytes": 592862868
+  },
+  "counts_sha256": "c5d01c76b8a6a99b5c658b51b5650d7926d4e57617c1253a8f9afc7f21021b22",
+  "custom_special_tokens": [
+    "<|fim_prefix|>",
+    "<|fim_middle|>",
+    "<|fim_suffix|>",
+    "<|fim_pad|>",
+    "<|reserved_0|>",
+    "<|reserved_1|>",
+    "<|reserved_2|>",
+    "<|reserved_3|>",
+    "<|reserved_4|>",
+    "<|reserved_5|>",
+    "<|reserved_6|>",
+    "<|reserved_7|>",
+    "<|reserved_8|>",
+    "<|reserved_9|>",
+    "<|reserved_10|>",
+    "<|reserved_11|>",
+    "<|reserved_12|>",
+    "<|reserved_13|>",
+    "<|reserved_14|>",
+    "<|reserved_15|>"
+  ],
+  "gemma_native_special_tokens": [
+    "<pad>",
+    "<eos>",
+    "<bos>",
+    "<unk>",
+    "<|tool>",
+    "<tool|>",
+    "<|tool_call>",
+    "<tool_call|>",
+    "<|tool_response>",
+    "<tool_response|>",
+    "<|\"|>",
+    "<|think|>",
+    "<|channel>",
+    "<channel|>",
+    "<|turn>",
+    "<turn|>"
+  ],
+  "name": "gemma4-en-code-81920",
+  "native_gemma_tokens": 81900,
+  "protected_native_tokens_before_closure": 4730,
+  "retained_merges": 209270,
+  "selection": {
+    "mandatory_native_closure": 4730,
+    "minimal_closure_cache": {
+      "currsize": 90551,
+      "hits": 469510,
+      "maxsize": null,
+      "misses": 90551
+    },
+    "selected_native_tokens": 81900,
+    "selected_original_token_fraction": 0.9956916040010924,
+    "selected_original_token_mass": 125126455,
+    "skipped_for_closure_budget": 0,
+    "total_original_token_mass": 125667882
+  },
+  "source_gemma_tokenizer_sha256": "12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6",
+  "target_vocab_size": 81920,
+  "tokenizer_sha256": "d3fe07a051ce0bbe1c111f7a4c88638451b175da2282338d90f978b00e39bf97",
+  "validation": {
+    "bos_once": true,
+    "byte_tokens": 256,
+    "canonical_prompt_mapping_exact": true,
+    "custom_specials_atomic": 20,
+    "dense_ids": true,
+    "exact_protected_segmentations": 6,
+    "native_specials_atomic": 16,
+    "reachable_native_tokens": 81900,
+    "round_trip_cases": 11,
+    "teacher_mapping_round_trip_cases": 11
+  }
+}

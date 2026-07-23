@@ -40,16 +40,26 @@ DATA_CACHE_DIR = os.path.join(PROJECT_ROOT, "data", "hellaswag")
 TOKENIZER_PATH = os.path.join(PROJECT_ROOT, "data", "tokenizer", "tokenizer.json")
 EOT_ID = 65527  # <|bos|> in custom 64k BPE tokenizer (used as sequence boundary)
 
-_enc = None
+_encoders = {}
 
 
-def _get_enc():
-    global _enc
-    if _enc is None:
+def _get_enc(tokenizer_path=None):
+    path = tokenizer_path or TOKENIZER_PATH
+    if path not in _encoders:
         from tokenizers import Tokenizer
 
-        _enc = Tokenizer.from_file(TOKENIZER_PATH)
-    return _enc
+        _encoders[path] = Tokenizer.from_file(path)
+    return _encoders[path]
+
+
+def _bos_id(enc, bos_id=None):
+    if bos_id is not None:
+        return bos_id
+    for token in ("<bos>", "<|bos|>"):
+        token_id = enc.token_to_id(token)
+        if token_id is not None:
+            return token_id
+    return EOT_ID
 
 
 def download_file(url: str, fname: str, chunk_size=1024):
@@ -81,7 +91,7 @@ def download(split):
         download_file(data_url, data_filename)
 
 
-def render_example(example):
+def render_example(example, tokenizer=None, bos_id=None):
     """
     Given the example as a dictionary, render it as three torch tensors:
     - tokens (the tokens of context + completion, of size 4xN, as there are always 4 candidates)
@@ -96,14 +106,17 @@ def render_example(example):
     data = {"label": label, "ctx_tokens": None, "ending_tokens": []}
 
     # gather up all the tokens
-    enc = _get_enc()
-    ctx_tokens = [EOT_ID] + enc.encode(ctx).ids
+    enc = tokenizer or _get_enc()
+    boundary_id = _bos_id(enc, bos_id)
+    ctx_tokens = [boundary_id] + enc.encode(
+        ctx, add_special_tokens=False
+    ).ids
     data["ctx_tokens"] = ctx_tokens
     tok_rows = []
     mask_rows = []
     for end in endings:
         end_tokens = enc.encode(
-            " " + end
+            " " + end, add_special_tokens=False
         ).ids  # prepend space for byte-level BPE word boundary
         tok_rows.append(ctx_tokens + end_tokens)
         mask_rows.append([0] * len(ctx_tokens) + [1] * len(end_tokens))
@@ -131,6 +144,8 @@ def iterate_examples(split):
 
 @torch.no_grad()
 def evaluate(model_type, device):
+    from transformers import GPT2LMHeadModel
+
     torch.set_float32_matmul_precision("high")  # use tf32
     model = GPT2LMHeadModel.from_pretrained(model_type)
     model.to(device)
@@ -180,7 +195,7 @@ def evaluate(model_type, device):
         if num_total < 10:
             print("---")
             print(f"Context:\n {example['ctx']}")
-            print(f"Endings:")
+            print("Endings:")
             for i, end in enumerate(example["endings"]):
                 print(f"{i} (loss: {avg_loss[i].item():.4f}) {end}")
             print(f"predicted: {pred_norm}, actual: {label}")

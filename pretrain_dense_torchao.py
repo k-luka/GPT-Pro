@@ -19,6 +19,7 @@ from torchao.prototype.moe_training.config import (
 )
 
 from src.models.gpt_dense_torchao import GPT
+from src.datasets.shard_format import read_metadata, sha256_file
 from src.training.trainer_dense_torchao import Trainer, TrainerConfig
 from src.utils.helpers import estimate_flops, print_trainable_parameters
 
@@ -59,7 +60,36 @@ def _run_training(
 
     from tokenizers import Tokenizer
 
-    enc = Tokenizer.from_file("data/tokenizer/tokenizer.json")
+    tokenizer_path = cfg.data.get("tokenizer_path", "data/tokenizer/tokenizer.json")
+    enc = Tokenizer.from_file(tokenizer_path)
+    tokenizer_vocab_size = enc.get_vocab_size()
+    if tokenizer_vocab_size != cfg.model.vocab_size:
+        raise ValueError(
+            f"tokenizer vocab size {tokenizer_vocab_size} does not match "
+            f"model.vocab_size {cfg.model.vocab_size}"
+        )
+    tokenizer_sha256 = sha256_file(tokenizer_path)
+    for data_root in {cfg.data.train_data_root, cfg.data.val_data_root}:
+        metadata = read_metadata(
+            data_root, allow_legacy=tokenizer_vocab_size <= 2**16
+        )
+        if metadata.get("legacy"):
+            continue
+        if metadata["vocab_size"] != tokenizer_vocab_size:
+            raise ValueError(
+                f"dataset {data_root} uses vocab size {metadata['vocab_size']}, "
+                f"but the configured tokenizer uses {tokenizer_vocab_size}"
+            )
+        if metadata["tokenizer_sha256"] != tokenizer_sha256:
+            raise ValueError(
+                f"dataset {data_root} was built with tokenizer SHA "
+                f"{metadata['tokenizer_sha256']}, not {tokenizer_sha256}"
+            )
+        bos_id = enc.token_to_id(metadata["bos_token"])
+        if bos_id != metadata["bos_id"]:
+            raise ValueError(
+                f"dataset {data_root} BOS mapping does not match the tokenizer"
+            )
 
     # Seed all ranks identically so controlled A/B runs (e.g. sandwich-norm on
     # vs off) start from the same weight init. Data order is already
@@ -96,6 +126,28 @@ def _run_training(
         mtp_lambda=cfg.model.get("mtp_lambda", 0.3),
         # p-RoPE (Gemma): fraction of frequency pairs that get rotated (1.0=full).
         rope_p=cfg.model.get("rope_p", 1.0),
+        # Per-layer-type attention geometry (Gemma-4 style asymmetric heads).
+        # head_dim=0 derives from n_embd/n_heads; global_* default to the local
+        # values. Keys are optional in the YAML — pass via Hydra +model.<key>=.
+        head_dim=cfg.model.get("head_dim", 0),
+        global_n_heads=cfg.model.get("global_n_heads", 0),
+        global_n_kv_heads=cfg.model.get("global_n_kv_heads", 0),
+        global_head_dim=cfg.model.get("global_head_dim", 0),
+        rope_theta=cfg.model.get("rope_theta", 10000.0),
+        global_rope_theta=cfg.model.get("global_rope_theta", 0.0),
+        global_rope_p=cfg.model.get("global_rope_p", 0.0),
+        # First-class normalization choice. Older experiment configs may omit
+        # this and continue to use the SANDWICH_NORM environment fallback.
+        sandwich_norm=cfg.model.get("sandwich_norm", None),
+        # First-class forms of the attention A/B environment toggles. Explicit
+        # YAML values win; absent keys retain compatibility with old scripts.
+        qk_norm_mode=cfg.model.get("qk_norm_mode", None),
+        local_attn_impl=cfg.model.get("local_attn_impl", None),
+        global_attn_impl=cfg.model.get("global_attn_impl", None),
+        global_attn_placement=cfg.model.get("global_attn_placement", None),
+        # Weight tying between token embedding and lm_head. Default True; set
+        # model.tie_embeddings=false to untie (large-vocab experiments).
+        tie_embeddings=cfg.model.get("tie_embeddings", True),
         dtype=torch.bfloat16,
     )
     model.to(device_obj)
@@ -149,16 +201,29 @@ def _run_training(
             f"with {n_global}/{model.n_layers} global layers "
             f"(global at {[i for i, g in enumerate(model.is_global) if g]}) |---"
         )
+        print(
+            f"---| Attention kernels: local={model.local_attn_impl}, "
+            f"global={model.global_attn_impl}; QK norm={model.qk_norm_mode} |---"
+        )
     if master_rank and model.mtp_depth > 0:
         print(
             f"---| MTP: DeepSeek-V3 multi-token prediction, depth={model.mtp_depth} "
             f"(predicts +2..+{model.mtp_depth + 1} tokens), lambda={model.mtp_lambda} |---"
         )
-
-    model = DDP(model, device_ids=[local_rank])
+    if master_rank:
+        norm_name = "sandwich (pre+post)" if model.sandwich_norm else "pre-norm"
+        print(f"---| Normalization: {norm_name} RMSNorm |---")
 
     torch._dynamo.config.capture_profiler_record_function = True
     model = torch.compile(model)
+
+    # DDP wraps the COMPILED module (not the reverse). This keeps DDP's internal
+    # buffer/param broadcast (_broadcast_coalesced, a pybind C++ collective) OUTSIDE
+    # the compiled graph, so Dynamo no longer tries to trace it and graph-break at
+    # the first forward (the "does not know how to trace ... _broadcast_coalesced"
+    # UserWarning). no_sync() (used for grad-accum) needs DDP as the OUTER wrapper —
+    # satisfied here — and _unwrap() (DDP.module -> ._orig_mod) still reaches the GPT.
+    model = DDP(model, device_ids=[local_rank])
 
     trainer_config = TrainerConfig(
         run_name=cfg.experiment.run_name,
@@ -166,6 +231,7 @@ def _run_training(
         block_size=cfg.model.block_size,
         grad_accum_steps=cfg.training.grad_accum_steps,
         max_steps=cfg.training.max_steps,
+        stop_after_steps=cfg.training.get("stop_after_steps", None),
         warmup_steps=cfg.training.warmup_steps,
         warmdown_ratio=cfg.training.get("warmdown_ratio", 0.3),
         min_lr=cfg.training.min_lr,

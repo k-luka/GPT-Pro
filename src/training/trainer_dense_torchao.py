@@ -15,8 +15,9 @@ Twin of src/training/trainer_dense.py. Differences:
     through RMSNorm would break it. lm_head is left out of quantize_ and stays
     BF16 by design.
 
-Requires the torch-nightly env (LLM_torchao_nightly): the MXFP8 training tensor
-is gated on torch.distributed.tensor internals absent from torch 2.11 release.
+Requires the torchao nightly env (conda env `torchao`: torch 2.12.dev, torchao
+0.18.dev): the MXFP8 training tensor is gated on torch.distributed.tensor
+internals absent from the torch 2.11 / torchao 0.17 stable release.
 """
 
 import contextlib
@@ -82,6 +83,10 @@ class TrainerConfig:
     grad_accum_steps: int = 4
     block_size: int = 1024
     max_steps: int = 1000
+    # Optional wall for staged experiments. The LR schedule still uses
+    # max_steps, so an early screening stage does not receive an artificial
+    # warmdown. Resume later with a larger stop_after_steps value.
+    stop_after_steps: int | None = None
     warmup_steps: int = 100
     warmdown_ratio: float = 0.3
     max_lr: float = 6e-4
@@ -129,6 +134,7 @@ class Trainer:
 
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
+        expected_vocab_size = tokenizer.get_vocab_size() if tokenizer else None
 
         self.train_loader = DataLoader(
             train_data_root,
@@ -137,6 +143,7 @@ class Trainer:
             "train",
             rank=self.rank,
             world_size=self.world_size,
+            expected_vocab_size=expected_vocab_size,
         )
         self.val_loader = DataLoader(
             val_data_root,
@@ -145,6 +152,7 @@ class Trainer:
             "val",
             rank=self.rank,
             world_size=self.world_size,
+            expected_vocab_size=expected_vocab_size,
         )
 
         self.optimizer = _unwrap(self.model).configure_optimizers(
@@ -161,10 +169,10 @@ class Trainer:
         # sample of the loaded val shard.
         self.bytes_per_token = None
         try:
-            from scripts.data_prep.hellaswag import _get_enc
-
             sample = self.val_loader.tokens[:100000].tolist()
-            text = _get_enc().decode(sample)
+            if self.tokenizer is None:
+                raise ValueError("val_bpb requires the configured tokenizer")
+            text = self.tokenizer.decode(sample, skip_special_tokens=True)
             n_bytes = len(text.encode("utf-8"))
             if n_bytes > 0:
                 self.bytes_per_token = n_bytes / len(sample)
@@ -286,6 +294,14 @@ class Trainer:
 
     def train(self, resume_from_checkpoint=None):
         self.model.train()
+        eval_model = _unwrap(self.model)
+
+        end_step = self.config.stop_after_steps or self.config.max_steps
+        if end_step > self.config.max_steps:
+            raise ValueError(
+                f"stop_after_steps ({end_step}) cannot exceed max_steps "
+                f"({self.config.max_steps})"
+            )
 
         start_step = 1
         if resume_from_checkpoint is not None:
@@ -293,16 +309,20 @@ class Trainer:
             start_step = self.step + 1
             if self.rank == 0:
                 print(
-                    f"---| Resuming training from step {start_step} until {self.config.max_steps} |---"
+                    f"---| Resuming training from step {start_step} until {end_step} "
+                    f"(LR horizon {self.config.max_steps}) |---"
                 )
             self.train_loader.set_step(self.step, self.config.grad_accum_steps)
 
         else:
             if self.rank == 0:
-                print(f"---| Starting training for {self.config.max_steps} |---")
+                print(
+                    f"---| Starting training until step {end_step} "
+                    f"(LR horizon {self.config.max_steps}) |---"
+                )
 
         best_val_loss = 100
-        for step in range(start_step, self.config.max_steps + 1):
+        for step in range(start_step, end_step + 1):
             self.step = step
             t0 = time.time()
             lr = self.get_lr(step)
@@ -312,12 +332,14 @@ class Trainer:
             torch.cuda.synchronize()
             t1 = time.time()
             dt = t1 - t0
-            tps = (
-                self.train_loader.B
-                * self.train_loader.T
-                * self.config.grad_accum_steps
-                * self.world_size
+            # Real aggregate tokens/sec: measured per-GPU rate x the GPUs actually
+            # running (world_size). On 1 GPU this is the true 1-GPU throughput; on
+            # N GPUs it is the real N-GPU aggregate. No projection — it always
+            # reflects however many GPUs are present right now.
+            per_gpu = (
+                self.train_loader.B * self.train_loader.T * self.config.grad_accum_steps
             ) / dt
+            tps = per_gpu * self.world_size
 
             # Host-memory probe (all ranks participate in the collective). Sum of
             # per-rank VmRSS approximates the cgroup total that the --mem limit
@@ -351,12 +373,13 @@ class Trainer:
                     )
                 if step % self.config.logging_steps == 0:
                     print(
-                        f"Step: {step} | loss: {loss:.6f} | dt: {dt * 1000:.4f} ms | tokens/sec: {tps:.4f}"
+                        f"Step: {step} | loss: {loss:.6f} | dt: {dt * 1000:.2f} ms | "
+                        f"tokens/sec: {tps:,.0f}"
                     )
             val_loss = None
             if step % self.config.eval_interval == 0:
                 val_loss = estimate_loss(
-                    self.model,
+                    eval_model,
                     self.val_loader,
                     self.config.eval_steps,
                     self.config.device,
@@ -371,15 +394,19 @@ class Trainer:
                 hella_acc = None
                 if self.config.eval_hellaswag:
                     hella_acc = evaluate_hella_swag(
-                        self.model, self.config.device, use_autocast=False
+                        eval_model,
+                        self.config.device,
+                        use_autocast=False,
+                        tokenizer=self.tokenizer,
                     )
                 core_results = None
                 if self.config.eval_core:
                     core_results = evaluate_core(
-                        self.model,
+                        eval_model,
                         self.config.device,
                         use_autocast=False,
                         max_examples=self.config.core_max_examples,
+                        tokenizer=self.tokenizer,
                     )
                 val_bpb = (
                     val_loss / (math.log(2) * self.bytes_per_token)
@@ -420,7 +447,7 @@ class Trainer:
             if step % self.config.checkpoint_interval == 0:
                 if val_loss is None:
                     val_loss = estimate_loss(
-                        self.model,
+                        eval_model,
                         self.val_loader,
                         self.config.eval_steps,
                         self.config.device,

@@ -17,22 +17,27 @@ HellaSwag stays in its own module (already wired into the trainer).
 
 import torch
 
-from scripts.data_prep.hellaswag import _get_enc, EOT_ID
+from scripts.data_prep.hellaswag import _bos_id, _get_enc
 
 
-def render_mc(context, choices, label):
+def render_mc(context, choices, label, tokenizer=None, bos_id=None):
     """Render a multiple-choice example to (tokens, mask, label).
 
     tokens/mask are (n_choices, max_len); mask is 1 over the choice tokens
     (where we score the LM loss), 0 over the shared context. Mirrors
     hellaswag.render_example but for an arbitrary number of choices.
     """
-    enc = _get_enc()
-    ctx_tokens = [EOT_ID] + enc.encode(context).ids
+    enc = tokenizer or _get_enc()
+    boundary_id = _bos_id(enc, bos_id)
+    ctx_tokens = [boundary_id] + enc.encode(
+        context, add_special_tokens=False
+    ).ids
     tok_rows, mask_rows = [], []
     for choice in choices:
         # leading space for byte-level BPE word boundary, matching HellaSwag
-        end_tokens = enc.encode(" " + str(choice)).ids
+        end_tokens = enc.encode(
+            " " + str(choice), add_special_tokens=False
+        ).ids
         tok_rows.append(ctx_tokens + end_tokens)
         mask_rows.append([0] * len(ctx_tokens) + [1] * len(end_tokens))
 

@@ -65,19 +65,30 @@ def print_trainable_parameters(cfg, model):
     params_layer_total = params_gqa + params_ffn_total + params_block_ln
     params_layer_active = params_gqa + params_ffn_active + params_block_ln
 
-    # 4. Final Sums
-    total_params = params_emb + (n_layers * params_layer_total) + params_ln_f
-    active_params = params_emb + (n_layers * params_layer_active) + params_ln_f
+    # 4. Final Sums.
+    # Analytic estimate from config — now respects weight tying: an UNTIED model
+    # adds a second vocab*n_embd matrix for the lm_head (default tied -> once).
+    tie_embeddings = cfg.model.get("tie_embeddings", True)
+    params_head = 0 if tie_embeddings else vocab_size * n_embd
+    total_params = (
+        params_emb + params_head + (n_layers * params_layer_total) + params_ln_f
+    )
+    active_params = (
+        params_emb + params_head + (n_layers * params_layer_active) + params_ln_f
+    )
 
-    params_per_shard = 0
-    for i, param in enumerate(model.parameters()):
-        params_per_shard += param.numel()
+    # Ground truth: count the ACTUAL constructed model. This never drifts when the
+    # architecture changes (tying, extra heads, new modules) — always trust it
+    # over the analytic estimate. Under DDP it is the full model on each rank;
+    # under FSDP it would be this rank's shard.
+    counted_params = sum(p.numel() for p in model.parameters())
 
     print("| --------------------------------------------------------------------")
     print(f"| Config: {cfg.experiment.run_name}")
     print(
         f"| Architecture: {n_layers} layers, {n_heads} heads ({n_kv_heads} KV), {n_embd} dim"
     )
+    print(f"| Weight tying: {'on' if tie_embeddings else 'OFF (separate lm_head)'}")
     if ffn_hidden_size is not None:
         print(f"| FFN: dense SwiGLU, hidden {ffn_hidden_size}")
     else:
@@ -85,16 +96,22 @@ def print_trainable_parameters(cfg, model):
             f"| Experts: {n_routed} routed, {cfg.model.get('n_shared_experts', 0)} shared, TopK: {cfg.model.get('topk_experts', 0)}"
         )
     print("| --------------------------------------------------------------------")
+    # Counted-from-model is authoritative; analytic is a cross-check.
     print(
-        f"| Total Params (Storage):      {humanize.intword(total_params)} ({total_params:,})"
+        f"| Total Params (counted):      {humanize.intword(counted_params)} ({counted_params:,})"
+    )
+    print(
+        f"| Total Params (analytic est): {humanize.intword(total_params)} ({total_params:,})"
     )
     print(
         f"| Active Params (Forward):     {humanize.intword(active_params)} ({active_params:,})"
     )
-    print(
-        f"| True Params per GPU:         {humanize.intword(params_per_shard)} ({params_per_shard:,})"
-    )
-    print(f"| Utilization:                 {active_params/total_params:.1%}")
+    print(f"| Utilization (active/total):  {active_params / total_params:.1%}")
+    if total_params and abs(counted_params - total_params) / total_params > 0.005:
+        print(
+            "| WARNING: analytic estimate disagrees with counted params by "
+            f"{(counted_params - total_params) / total_params:+.1%} — trust 'counted'."
+        )
 
 
 def estimate_flops(cfg):

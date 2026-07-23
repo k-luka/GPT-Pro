@@ -15,6 +15,7 @@ Structural twin of src/models/gpt_dense.py. Differences:
 
 import inspect
 import math
+import os
 
 import torch
 import torch.distributed as dist
@@ -22,17 +23,60 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
+from src.models.fa4_attn import fa4_attention
 from src.utils.helpers import apply_rotary_emb
 
 
+def _resolve_sandwich_norm(sandwich_norm):
+    """Resolve the explicit config value, retaining env support for old scripts."""
+    if sandwich_norm is not None:
+        if not isinstance(sandwich_norm, bool):
+            raise TypeError(
+                "sandwich_norm must be a boolean when set explicitly, "
+                f"got {type(sandwich_norm).__name__}"
+            )
+        return sandwich_norm
+
+    env_value = os.environ.get("SANDWICH_NORM", "on")
+    if env_value not in {"on", "off"}:
+        raise ValueError(
+            "SANDWICH_NORM must be 'on' or 'off' when model.sandwich_norm "
+            f"is absent, got {env_value!r}"
+        )
+    return env_value == "on"
+
+
+def _resolve_choice(value, env_name, default, allowed):
+    """Resolve an explicit config string before its legacy environment fallback."""
+    resolved = value if value is not None else os.environ.get(env_name, default)
+    if resolved not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ValueError(f"{env_name} must be one of {{{choices}}}, got {resolved!r}")
+    return resolved
+
+
 class GQA(nn.Module):
-    def __init__(self, n_embd, n_heads, n_kv_heads, dtype=None):
+    def __init__(
+        self,
+        n_embd,
+        n_heads,
+        n_kv_heads,
+        dtype=None,
+        is_global=True,
+        sliding_window=0,
+        head_dim=0,
+        qk_norm_mode=None,
+        local_attn_impl=None,
+        global_attn_impl=None,
+    ):
         super().__init__()
-        assert n_embd % n_heads == 0, "n_embd must be divisible by n_heads"
         assert n_heads % n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
-        self.head_dim = n_embd // n_heads
+        # head_dim decouples head width from n_embd (Gemma 4 over-provisions:
+        # e.g. E2B projects hidden 1536 -> 8 heads x 512 = 4096 on global
+        # layers). 0 = derive from n_embd as before.
+        self.head_dim = head_dim or n_embd // n_heads
 
         self.w_q = nn.Linear(n_embd, n_heads * self.head_dim, bias=False, dtype=dtype)
         self.w_k = nn.Linear(
@@ -44,32 +88,100 @@ class GQA(nn.Module):
         self.proj = nn.Linear(n_heads * self.head_dim, n_embd, bias=False, dtype=dtype)
         self.proj.RESIDUAL_SCALE_INIT_FACTOR = True
 
-        self.q_norm = nn.RMSNorm(self.head_dim, dtype=dtype)
-        self.k_norm = nn.RMSNorm(self.head_dim, dtype=dtype)
+        # Overnight A/B toggle. Read once at construct time; each run is a fresh
+        # process so torch.compile bakes it in as a constant. "after" (default)
+        # = current behavior (QK-norm after RoPE); "before" = QK-norm before RoPE;
+        # "off" = no QK-norm. Set via QK_NORM_MODE env var. Create the norm layers
+        # only when used — otherwise their params are unused in forward and DDP
+        # raises "parameters that were not used in producing loss".
+        self.qk_norm_mode = _resolve_choice(
+            qk_norm_mode, "QK_NORM_MODE", "after", {"after", "before", "off"}
+        )
+        if self.qk_norm_mode != "off":
+            self.q_norm = nn.RMSNorm(self.head_dim, dtype=dtype)
+            self.k_norm = nn.RMSNorm(self.head_dim, dtype=dtype)
+
+        # Attention kernel selection (env A/B toggles, read at construct time
+        # like the norm toggles above — torch.compile bakes them in).
+        #   ATTN_IMPL        = flex (default) | fa4  — LOCAL (sliding-window) layers
+        #   GLOBAL_ATTN_IMPL = sdpa | fa4 | sdpa_eff — GLOBAL (full-causal) layers
+        #     (default: sdpa, or sdpa_eff when head_dim > 256)
+        # FA4 (flash_attn.cute) is the fastest kernel on B200 for windowed
+        # head_dim <= 128 and for full-causal head_dim 256; cuDNN SDPA remains
+        # fastest for full-causal head_dim 128. FA4 has no windowed kernel for
+        # head_dim 256 on SM100 — local layers there must stay on flex.
+        # head_dim > 256 (Gemma-4 global layers are 512): the mem-efficient SDPA
+        # backend is the ONLY kernel on B200 that runs it fwd+bwd (flash/cuDNN
+        # cap at 256, FA4 caps at 256, flex overflows shared memory) — measured
+        # 84 ms vs 238 ms math fallback at B16/S4096/8Q/1KV.
+        if is_global:
+            default = "sdpa_eff" if self.head_dim > 256 else "sdpa"
+            impl = _resolve_choice(
+                global_attn_impl,
+                "GLOBAL_ATTN_IMPL",
+                default,
+                {"sdpa", "sdpa_eff", "fa4"},
+            )
+        else:
+            impl = _resolve_choice(
+                local_attn_impl, "ATTN_IMPL", "flex", {"flex", "fa4"}
+            )
+        self.attn_impl = impl
+        self.use_fa4 = impl == "fa4"
+        self.use_sdpa_eff = impl == "sdpa_eff"
+        self.fa4_window = 0 if is_global else sliding_window
 
     def forward(self, x, sin, cos, block_mask=None):
         B, T, _ = x.shape
 
-        q = self.w_q(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.w_k(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.w_v(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.w_q(x).view(B, T, self.n_heads, self.head_dim)
+        k = self.w_k(x).view(B, T, self.n_kv_heads, self.head_dim)
+        v = self.w_v(x).view(B, T, self.n_kv_heads, self.head_dim)
+        if self.use_fa4:
+            # FA4 uses the (B, T, H, D) layout the projections already produce;
+            # only the rotary tables need re-broadcasting: (1,1,T,D) -> (1,T,1,D).
+            sin, cos = sin.transpose(1, 2), cos.transpose(1, 2)
+        else:
+            # SDPA / FlexAttention use (B, H, T, D).
+            q, k, v = (t.transpose(1, 2) for t in (q, k, v))
 
+        if self.qk_norm_mode == "before":
+            q, k = self.q_norm(q), self.k_norm(k)
         q = apply_rotary_emb(q, sin, cos).to(x.dtype)
         k = apply_rotary_emb(k, sin, cos).to(x.dtype)
-        q, k = self.q_norm(q), self.k_norm(k)
+        if self.qk_norm_mode == "after":
+            q, k = self.q_norm(q), self.k_norm(k)
 
-        if block_mask is None:
+        if self.use_fa4:
+            out = fa4_attention(q, k, v, sliding_window=self.fa4_window)
+            out = out.view(B, T, -1)
+        elif self.use_sdpa_eff:
+            # mem-efficient backend has no GQA support: expand KV to the query
+            # head count (free view when n_kv_heads == 1, else a copy). Without
+            # enable_gqa + with head_dim > 256, SDPA auto-dispatch lands on the
+            # mem-efficient kernel (flash/cuDNN reject the head dim).
+            if self.n_kv_heads == 1:
+                k = k.expand(B, self.n_heads, T, self.head_dim)
+                v = v.expand(B, self.n_heads, T, self.head_dim)
+            elif self.n_kv_heads != self.n_heads:
+                rep = self.n_heads // self.n_kv_heads
+                k = k.repeat_interleave(rep, dim=1)
+                v = v.repeat_interleave(rep, dim=1)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        elif block_mask is None:
             # Global layer: full causal attention via the (cuDNN) SDPA backend —
-            # fastest dense kernel on B200.
+            # fastest dense kernel on B200 at head_dim 128.
             out = F.scaled_dot_product_attention(
                 q, k, v, is_causal=True, enable_gqa=True
             )
+            out = out.transpose(1, 2).contiguous().view(B, T, -1)
         else:
             # Local layer: sliding-window causal attention via FlexAttention. The
             # block-sparse BlockMask skips off-window key blocks, cutting the K/V
             # working set (~40% less attention memory than full causal).
             out = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
-        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+            out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.proj(out)
 
 
@@ -95,24 +207,61 @@ class Block(nn.Module):
     sub-layer AND a post-norm on each sub-layer's output before the residual add.
     """
 
-    def __init__(self, n_embd, n_heads, n_kv_heads, ffn_hidden_size, dtype=None, is_global=True):
+    def __init__(
+        self,
+        n_embd,
+        n_heads,
+        n_kv_heads,
+        ffn_hidden_size,
+        dtype=None,
+        is_global=True,
+        sliding_window=0,
+        head_dim=0,
+        sandwich_norm=None,
+        qk_norm_mode=None,
+        local_attn_impl=None,
+        global_attn_impl=None,
+    ):
         super().__init__()
         # is_global=True  -> full causal attention (SDPA)
-        # is_global=False -> sliding-window local attention (FlexAttention)
+        # is_global=False -> sliding-window local attention (FlexAttention or FA4)
         self.is_global = is_global
+        # An explicit model config value wins. The environment fallback remains
+        # only so older A/B scripts continue to work unchanged.
+        # Create the post-norms ONLY when on — otherwise their params are never used
+        # in forward and DDP raises "parameters that were not used in producing loss".
+        self.sandwich = _resolve_sandwich_norm(sandwich_norm)
         self.ln1 = nn.RMSNorm(n_embd, dtype=dtype)
-        self.sa = GQA(n_embd, n_heads, n_kv_heads, dtype=dtype)
-        self.post_attn_norm = nn.RMSNorm(n_embd, dtype=dtype)
+        self.sa = GQA(
+            n_embd,
+            n_heads,
+            n_kv_heads,
+            dtype=dtype,
+            is_global=is_global,
+            sliding_window=sliding_window,
+            head_dim=head_dim,
+            qk_norm_mode=qk_norm_mode,
+            local_attn_impl=local_attn_impl,
+            global_attn_impl=global_attn_impl,
+        )
         self.ln2 = nn.RMSNorm(n_embd, dtype=dtype)
         self.mlp = MLP(n_embd, hidden_size=ffn_hidden_size, dtype=dtype)
-        self.post_mlp_norm = nn.RMSNorm(n_embd, dtype=dtype)
+        if self.sandwich:
+            self.post_attn_norm = nn.RMSNorm(n_embd, dtype=dtype)
+            self.post_mlp_norm = nn.RMSNorm(n_embd, dtype=dtype)
 
     def forward(self, x, sin, cos, local_block_mask=None):
         # Global blocks ignore the mask (None -> SDPA causal); local blocks use
         # the shared sliding-window BlockMask.
         block_mask = None if self.is_global else local_block_mask
-        x = x + self.post_attn_norm(self.sa(self.ln1(x), sin, cos, block_mask))
-        x = x + self.post_mlp_norm(self.mlp(self.ln2(x)))
+        if self.sandwich:
+            x = x + self.post_attn_norm(
+                self.sa(self.ln1(x), sin, cos, block_mask)
+            )
+            x = x + self.post_mlp_norm(self.mlp(self.ln2(x)))
+        else:
+            x = x + self.sa(self.ln1(x), sin, cos, block_mask)
+            x = x + self.mlp(self.ln2(x))
         return x
 
 
@@ -132,12 +281,32 @@ class GPT(nn.Module):
         mtp_depth=0,
         mtp_lambda=0.3,
         rope_p=1.0,
+        tie_embeddings=True,
+        head_dim=0,
+        global_n_heads=0,
+        global_n_kv_heads=0,
+        global_head_dim=0,
+        rope_theta=10000.0,
+        global_rope_theta=0.0,
+        global_rope_p=0.0,
+        sandwich_norm=None,
+        qk_norm_mode=None,
+        local_attn_impl=None,
+        global_attn_impl=None,
+        global_attn_placement=None,
     ):
         super().__init__()
         self.dtype = dtype
         self.block_size = block_size
         self.n_embd = n_embd
         self.n_layers = n_layers
+        self.sandwich_norm = _resolve_sandwich_norm(sandwich_norm)
+        self.qk_norm_mode = _resolve_choice(
+            qk_norm_mode, "QK_NORM_MODE", "after", {"after", "before", "off"}
+        )
+        self.local_attn_impl = _resolve_choice(
+            local_attn_impl, "ATTN_IMPL", "flex", {"flex", "fa4"}
+        )
         # p-RoPE (Gemma): rotate only the first `rope_p` fraction of frequency
         # pairs (the high-frequency, position-carrying ones); leave the
         # low-frequency tail un-rotated so it can encode semantics. rope_p=1.0
@@ -158,11 +327,29 @@ class GPT(nn.Module):
         # sliding_window <= 0 OR global_attn_every_n <= 0 disables locality
         # entirely (every layer is global) — recovers the original dense model.
         self.sliding_window = sliding_window
+        self.global_attn_placement = _resolve_choice(
+            global_attn_placement,
+            "GLOBAL_PLACEMENT",
+            "start",
+            {"start", "end"},
+        )
         if sliding_window > 0 and global_attn_every_n > 0:
-            self.is_global = [
-                (i % global_attn_every_n == 0) or (i == n_layers - 1)
-                for i in range(n_layers)
-            ]
+            # Global-layer placement (env A/B toggle, read at construct time):
+            #   "start" (default): global where i % n == 0, plus the last layer
+            #     -> for n=5: globals at 0,5,10,15,19 (layer 0 is a full layer).
+            #   "end": global where i % n == n-1
+            #     -> for n=5: globals at 4,9,14,19 (layer 0 is a WINDOW layer;
+            #        the pattern is 4 window : 1 full and ends on a full layer).
+            if self.global_attn_placement == "end":
+                self.is_global = [
+                    (i % global_attn_every_n == global_attn_every_n - 1)
+                    for i in range(n_layers)
+                ]
+            else:
+                self.is_global = [
+                    (i % global_attn_every_n == 0) or (i == n_layers - 1)
+                    for i in range(n_layers)
+                ]
         else:
             self.is_global = [True] * n_layers
         # Lazily-built, cached sliding-window BlockMasks keyed by sequence length.
@@ -170,26 +357,63 @@ class GPT(nn.Module):
         # path only reads them (no per-step graph break from create_block_mask).
         self._local_block_masks = {}
 
-        head_dim = n_embd // n_heads
-        sin, cos = self._precompute_rotary_embeddings(block_size, head_dim, rope_p=rope_p)
+        # Per-layer-type attention geometry (Gemma 4 style). Local (sliding)
+        # and global (full-causal) layers may differ in head count, KV head
+        # count, head width, RoPE base and p-RoPE fraction — e.g. Gemma-4 E2B:
+        # local 8Q/1KV x 256 theta 10k full-rotary, global 8Q/1KV x 512 theta 1M
+        # partial 0.25. All global_* params default to the local values, so
+        # existing configs are unchanged.
+        self.head_dim = head_dim or n_embd // n_heads
+        self.g_n_heads = global_n_heads or n_heads
+        self.g_n_kv_heads = global_n_kv_heads or n_kv_heads
+        self.g_head_dim = global_head_dim or self.head_dim
+        default_global_impl = "sdpa_eff" if self.g_head_dim > 256 else "sdpa"
+        self.global_attn_impl = _resolve_choice(
+            global_attn_impl,
+            "GLOBAL_ATTN_IMPL",
+            default_global_impl,
+            {"sdpa", "sdpa_eff", "fa4"},
+        )
+        g_rope_theta = global_rope_theta or rope_theta
+        g_rope_p = global_rope_p or rope_p
+
+        sin, cos = self._precompute_rotary_embeddings(
+            block_size, self.head_dim, base=rope_theta, rope_p=rope_p
+        )
         self.register_buffer("sin", sin, persistent=False)
         self.register_buffer("cos", cos, persistent=False)
+        g_sin, g_cos = self._precompute_rotary_embeddings(
+            block_size, self.g_head_dim, base=g_rope_theta, rope_p=g_rope_p
+        )
+        self.register_buffer("g_sin", g_sin, persistent=False)
+        self.register_buffer("g_cos", g_cos, persistent=False)
         self.transformer = nn.ModuleList(
             [
                 Block(
                     n_embd,
-                    n_heads,
-                    n_kv_heads,
+                    self.g_n_heads if self.is_global[i] else n_heads,
+                    self.g_n_kv_heads if self.is_global[i] else n_kv_heads,
                     ffn_hidden_size=ffn_hidden_size,
                     dtype=dtype,
                     is_global=self.is_global[i],
+                    sliding_window=sliding_window,
+                    head_dim=self.g_head_dim if self.is_global[i] else self.head_dim,
+                    sandwich_norm=self.sandwich_norm,
+                    qk_norm_mode=self.qk_norm_mode,
+                    local_attn_impl=self.local_attn_impl,
+                    global_attn_impl=self.global_attn_impl,
                 )
                 for i in range(n_layers)
             ]
         )
         self.ln = nn.RMSNorm(n_embd, dtype=dtype)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False, dtype=dtype)
-        self.wte.weight = self.lm_head.weight  # weight tying
+        # Weight tying (default). Untie for large-vocab experiments: separate wte
+        # and lm_head roughly double the embedding params + optimizer state (at
+        # 248k vocab / 4096 dim ~ +1.0B params, +~10 GiB measured) but cost
+        # ~no throughput. Set model.tie_embeddings=false to untie.
+        if tie_embeddings:
+            self.wte.weight = self.lm_head.weight  # weight tying
 
         # DeepSeek-V3 MTP modules. Module k (0-indexed) combines the previous
         # depth's hidden with the embedding of the next input token via
@@ -218,6 +442,11 @@ class GPT(nn.Module):
                         ffn_hidden_size=ffn_hidden_size,
                         dtype=dtype,
                         is_global=True,  # standalone single layers -> full causal
+                        head_dim=self.head_dim,  # local geometry: fed sin/cos
+                        sandwich_norm=self.sandwich_norm,
+                        qk_norm_mode=self.qk_norm_mode,
+                        local_attn_impl=self.local_attn_impl,
+                        global_attn_impl=self.global_attn_impl,
                     )
                     for _ in range(mtp_depth)
                 ]
@@ -229,6 +458,10 @@ class GPT(nn.Module):
     @property
     def has_local_layers(self):
         return self.sliding_window > 0 and not all(self.is_global)
+
+    @property
+    def needs_local_block_mask(self):
+        return self.has_local_layers and self.local_attn_impl == "flex"
 
     def _make_local_block_mask(self, T, device):
         """Build a causal sliding-window BlockMask for sequence length T.
@@ -251,7 +484,7 @@ class GPT(nn.Module):
         so the compiled forward only reads cached masks (no create_block_mask in
         the hot path, which would otherwise force a graph break each step).
         """
-        if not self.has_local_layers:
+        if not self.needs_local_block_mask:
             return
         for T in {int(t) for t in seq_lens}:
             self._local_block_masks[T] = self._make_local_block_mask(T, device)
@@ -259,6 +492,8 @@ class GPT(nn.Module):
     def _init_weights(self, module):
         std = 0.015
         if isinstance(module, (nn.Linear, nn.Embedding)):
+            if hasattr(module, "SKIP_GPT_INIT"):
+                return
             if hasattr(module, "RESIDUAL_SCALE_INIT_FACTOR"):
                 std *= 1 / (math.sqrt(2 * self.n_layers))
             if hasattr(module, "weight"):
@@ -275,19 +510,24 @@ class GPT(nn.Module):
         x = emb_all
         sin = self.sin[:, :, :T, :]
         cos = self.cos[:, :, :T, :]
+        g_sin = self.g_sin[:, :, :T, :]
+        g_cos = self.g_cos[:, :, :T, :]
 
         # Shared sliding-window mask for all local layers at this T. Prefer the
         # cached mask (built before compile); fall back to building one for
         # sequence lengths not pre-registered (e.g. generate()).
         local_block_mask = None
-        if self.has_local_layers:
+        if self.needs_local_block_mask:
             local_block_mask = self._local_block_masks.get(T)
             if local_block_mask is None:
                 local_block_mask = self._make_local_block_mask(T, idx.device)
                 self._local_block_masks[T] = local_block_mask
 
         for block in self.transformer:
-            x = block(x, sin, cos, local_block_mask)
+            if block.is_global:
+                x = block(x, g_sin, g_cos, local_block_mask)
+            else:
+                x = block(x, sin, cos, local_block_mask)
         h_trunk = x  # main trunk representation (h^0 for the MTP chain)
         x = self.ln(h_trunk)
 
@@ -395,7 +635,7 @@ class GPT(nn.Module):
                 f"Muon params (2D hidden): {len(muon_params)} tensors, {sum(p.numel() for p in muon_params):,} parameters"
             )
             print(
-                f"AdamW decay params (Embed/Head): {len(adamw_decay_params)} tensors, {sum(p.numel() for p in adamw_decay_params):,} parameters"
+                f"AdamW decay params (embed/head): {len(adamw_decay_params)} tensors, {sum(p.numel() for p in adamw_decay_params):,} parameters"
             )
             print(
                 f"AdamW no-decay params (1D norms): {len(adamw_nodecay_params)} tensors, {sum(p.numel() for p in adamw_nodecay_params):,} parameters"

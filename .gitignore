@@ -1,11 +1,30 @@
-output/
+# Training artifacts
 data/
+output/
 wandb/
+logs/
+experiments/
+*.log
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+
+# Local environments and secrets
+.env
+.venv/
 run.sh
 pyrefly.toml
+
+# Editor and agent state
+.agents/
+.claude/
+.codex/
+.cursor/
+
+# Local-only scratch files
+scripts/data/
 src/model_practice.py
 LLM_pretrain.log
 LLM_2_pretrain.log
-scripts/data_prep/*.log

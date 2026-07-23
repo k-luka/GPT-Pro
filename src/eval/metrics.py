@@ -2,8 +2,6 @@ import contextlib
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-import os
-import sys
 from scripts.data_prep.hellaswag import iterate_examples, render_example
 
 
@@ -54,7 +52,14 @@ def estimate_loss(model, loader, eval_steps, device, use_autocast=True):
 
 
 @torch.no_grad()
-def evaluate_core(model, device, use_autocast=True, max_examples=1000, tasks=None):
+def evaluate_core(
+    model,
+    device,
+    use_autocast=True,
+    max_examples=1000,
+    tasks=None,
+    tokenizer=None,
+):
     """CORE-style multiple-choice suite (ARC-Easy/Challenge, PIQA, ...).
 
     Scores each task like HellaSwag (lowest length-normalized loss wins),
@@ -83,7 +88,10 @@ def evaluate_core(model, device, use_autocast=True, max_examples=1000, tasks=Non
                 if i % world != rank:  # shard across ranks
                     continue
                 tokens, mask, label = render_mc(
-                    ex["context"], ex["choices"], ex["label"]
+                    ex["context"],
+                    ex["choices"],
+                    ex["label"],
+                    tokenizer=tokenizer,
                 )
                 tokens = tokens.to(device)
                 mask = mask.to(device)
@@ -121,7 +129,7 @@ def evaluate_core(model, device, use_autocast=True, max_examples=1000, tasks=Non
 
 
 @torch.no_grad()
-def evaluate_hella_swag(model, device, use_autocast=True):
+def evaluate_hella_swag(model, device, use_autocast=True, tokenizer=None):
     """
     Evaluates HellaSwag accuracy using the model.
     """
@@ -154,7 +162,7 @@ def evaluate_hella_swag(model, device, use_autocast=True):
 
         # Render example into tokens
         # Returns: data_dict, tokens(4, N), mask(4, N), label(int)
-        _, tokens, mask, label = render_example(example)
+        _, tokens, mask, label = render_example(example, tokenizer=tokenizer)
         tokens = tokens.to(device)
         mask = mask.to(device)
 
